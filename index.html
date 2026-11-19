@@ -1,60 +1,160 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <meta charset="UTF-8">
     <!--
     ========================================================================
-    PROJECT: TV Dashboard Slideshow
-    DESCRIPTION: A FOSS-ready, zero-dependency (aside from Tailwind) 
-                 single-page application designed to run locally or hosted. 
-                 It cycles through multiple URLs in full-screen iframes, 
-                 intended for digital signage, NOC dashboards, or TV displays.
-                 
-    REQUIREMENT: To embed restricted sites (like zoom.earth), a browser 
-                 extension such as "Ignore X-Frame-Options" must be installed 
-                 on the host machine to bypass CORS/Frame security headers.
+    SiteRover: a single-file URL rotator for TV displays, kiosks and
+    dashboards. https://github.com/alexis-nieto/site-rover
 
-    FEATURES:
-    - Smooth crossfading between an infinite number of URL iframes.
-    - Draggable, resizable components with persistence.
-    - JSON Export/Import functionality for deployment across multiple screens.
-    - Dual-state management (Live state vs Baseline/Imported state).
+    Copyright (C) 2026 The SiteRover contributors
+    SPDX-License-Identifier: GPL-3.0-or-later
+
+    This program is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the
+    Free Software Foundation, either version 3 of the License, or (at your
+    option) any later version. It is distributed WITHOUT ANY WARRANTY; see
+    the LICENSE file or <https://www.gnu.org/licenses/> for details.
+
+    HOW IT WORKS
+    Every configured URL is loaded into its own full-screen iframe up front.
+    Only the active one is visible; switching slides crossfades opacity, so
+    each page is already rendered when it appears.
+
+    The slides come from config.json next to this file (or the file named
+    by ?config=... in the page URL). Changes made on screen are saved in
+    localStorage; if the config file itself changes, it wins on the next
+    load. Browsers don't let a page opened from disk (file://) read other
+    files, so in that case use Settings > Import Config once.
+
+    This file has no dependencies and no build step: it works offline,
+    straight from disk or from any static web host.
+
+    Many sites forbid being embedded (X-Frame-Options / CSP frame-ancestors)
+    and will show up blank. See "Sites that refuse to load" in the README.
     ========================================================================
     -->
-    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TV Dashboard Slideshow</title>
-    
-    <!-- Tailwind CSS for rapid styling -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    
+    <meta name="description" content="SiteRover rotates through web pages full-screen with smooth crossfades, for TV displays and kiosks.">
+    <title>SiteRover</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9A%99%3C/text%3E%3C/svg%3E">
+
     <style>
-        /* 
-         * GLOBAL STYLES 
-         * Lock the body to exactly viewport dimensions to prevent scrolling on TVs
-         */
-        body, html {
+        /* ------------------------------------------------------------------
+         * DESIGN TOKENS
+         * ------------------------------------------------------------------ */
+        :root {
+            --ui-bg: rgba(0, 0, 0, 0.7);
+            --ui-border: rgba(255, 255, 255, 0.2);
+            --gray-300: #d1d5db;
+            --gray-400: #9ca3af;
+            --gray-500: #6b7280;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+            --blue-100: #dbeafe;
+            --blue-300: #93c5fd;
+            --blue-500: #3b82f6;
+            --blue-600: #2563eb;
+            --blue-700: #1d4ed8;
+            --blue-900: #1e3a8a;
+            --red-400: #f87171;
+            --red-500: #ef4444;
+            --green-300: #86efac;
+            --green-600: #16a34a;
+            --green-700: #15803d;
+            --panel-radius: 12px;
+            --panel-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+            --panel-move: 0.6s ease;
+            --ui-opacity: 0.8; /* Set from the transparency setting */
+        }
+
+        /* ------------------------------------------------------------------
+         * RESET & GLOBALS
+         * The body is locked to the viewport so TVs never show scrollbars.
+         * ------------------------------------------------------------------ */
+        *, *::before, *::after { box-sizing: border-box; }
+        [hidden] { display: none !important; }
+
+        html, body {
             margin: 0;
             padding: 0;
             width: 100vw;
             height: 100vh;
             overflow: hidden;
-            background-color: #000; /* Deep black prevents flash on load */
-            font-family: 'Inter', sans-serif;
+            background-color: #000; /* Deep black prevents a flash on load */
             color: #fff;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.5;
         }
+        h1, h2, h3, p { margin: 0; }
+        button, input, output { font: inherit; color: inherit; }
+        button { cursor: pointer; }
+        svg { display: block; flex-shrink: 0; }
+        :focus-visible { outline: 2px solid var(--blue-500); outline-offset: 2px; }
 
-        /* 
-         * IFRAME CONTAINER LAYER (z-index: 1 to 10)
-         * All iframes are loaded simultaneously in the background. 
-         * Opacity transitions handle the crossfading.
-         */
+        .visually-hidden {
+            position: absolute !important;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+        .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+
+        /* Whatever is being dragged follows the pointer with no easing. */
+        .is-dragging { transition: none !important; }
+
+        /* ------------------------------------------------------------------
+         * PANELS: one look for everything that floats over the slides.
+         *   .panel      the shared look (also used by menus and Settings)
+         *   .floating   sits over the slides: transparency setting at rest,
+         *               fully opaque while hovered, dragged or in use
+         *   .resizable  resize corner while hovered; contents adapt to the
+         *               new size and shape (see the FITTING section in JS)
+         * .is-hovered is set by JS so it survives moving onto the edge tools.
+         * ------------------------------------------------------------------ */
+        .panel {
+            color: #fff;
+            background-color: var(--ui-bg);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--ui-border);
+            border-radius: var(--panel-radius);
+            box-shadow: var(--panel-shadow);
+        }
+        .floating {
+            position: absolute;
+            overflow: hidden; /* The resize corner needs it; contents adapt instead of spilling */
+            opacity: var(--ui-opacity);
+            transition: opacity 0.3s, top var(--panel-move), left var(--panel-move),
+                bottom var(--panel-move), right var(--panel-move);
+        }
+        .floating:hover,
+        .floating.is-hovered,
+        .floating.is-dragging,
+        .floating.has-open-menu,
+        .dashboard-label:focus-within { opacity: 1; }
+        /* Separate rule: browsers without :has() would drop the whole list above. */
+        .floating:has(:focus-visible) { opacity: 1; }
+        .resizable { resize: none; }
+        .resizable:hover, .resizable.is-hovered { resize: both; }
+
+        /* ------------------------------------------------------------------
+         * LAYER 1: IFRAMES (z-index 1-10)
+         * All iframes load at once; opacity transitions do the crossfade.
+         * ------------------------------------------------------------------ */
         #iframe-container {
             position: relative;
             width: 100%;
             height: 100%;
             z-index: 1;
         }
-        iframe {
+        #iframe-container iframe {
             position: absolute;
             top: 0;
             left: 0;
@@ -62,473 +162,1433 @@
             height: 100%;
             border: none;
             opacity: 0;
-            transition: opacity 1s ease-in-out; /* Smooth crossfade duration */
-            pointer-events: none; /* Inactive frames cannot be clicked */
+            transition: opacity 1s ease-in-out;
+            pointer-events: none; /* Hidden frames must not catch clicks */
             z-index: 1;
         }
-        iframe.active {
+        #iframe-container iframe.active {
             opacity: 1;
             z-index: 2;
-            pointer-events: auto; /* Allow interaction with the active frame */
+            pointer-events: auto;
         }
 
-        /* 
-         * UI COMPONENT LAYER (z-index: 50+)
-         * Reusable drag handle style 
-         */
-        .drag-handle {
-            cursor: grab;
+        #empty-state {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 4px;
-            color: #9ca3af;
-            transition: color 0.2s;
+            padding: 2rem;
         }
-        .drag-handle:hover { color: #fff; }
-        .drag-handle:active { cursor: grabbing; }
+        .empty-card {
+            max-width: 36rem;
+            padding: 1.5rem;
+            text-align: center;
+        }
+        .empty-card h2 {
+            margin-bottom: 0.5rem;
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+        .empty-card p {
+            margin-bottom: 1rem;
+            color: var(--gray-300);
+        }
+        .empty-card .btn-group { justify-content: center; }
 
-        /* Main Control Panel */
+        /* ------------------------------------------------------------------
+         * CONTROL PANEL
+         * A grid of square buttons. At its natural size it is one row; once
+         * resized, fitControls() picks the column count and button size that
+         * fill the new shape best.
+         * ------------------------------------------------------------------ */
         #control-panel {
-            position: absolute;
+            bottom: 24px;
+            right: 24px;
             z-index: 60;
-            display: flex;
-            background-color: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(8px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 9999px; /* Pill shape */
+            display: grid;
+            grid-auto-flow: column;
+            grid-auto-columns: var(--btn, 44px);
+            grid-auto-rows: var(--btn, 44px);
+            place-content: center;
+            min-width: 48px;
+            min-height: 48px;
+            max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px);
             padding: 4px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-            transition: opacity 0.3s;
+        }
+        #control-panel.is-fitted {
+            grid-auto-flow: row;
+            grid-template-columns: repeat(var(--cols), var(--btn));
         }
         .control-btn {
-            color: white;
-            border-radius: 50%;
-            width: 44px;
-            height: 44px;
             display: flex;
             align-items: center;
             justify-content: center;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            background: transparent;
-            border: none;
-        }
-        .control-btn:hover {
-            background-color: rgba(255, 255, 255, 0.1);
-        }
-
-        /* Floating Site Labels */
-        #label-container {
-            position: absolute;
-            top: 0;
-            left: 0;
             width: 100%;
             height: 100%;
-            pointer-events: none; /* Allows clicks to fall through to iframe */
+            padding: 0;
+            color: #fff;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            transition: background-color 0.2s ease;
+        }
+        .control-btn svg { width: 45%; height: 45%; }
+        .control-btn:hover,
+        .control-btn[aria-expanded="true"] { background-color: rgba(255, 255, 255, 0.12); }
+        .control-btn:focus-visible { outline-offset: -2px; }
+        .control-btn:disabled { opacity: 0.35; cursor: default; }
+        .control-btn:disabled:hover { background-color: transparent; }
+        .icon-muted { color: var(--red-400); }
+
+        /* Menus opened from control panel buttons. They live outside the panel
+           (so a resized panel can't clip them) and JS places them by the button. */
+        .menu {
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 110;
+            display: flex;
+            flex-direction: column;
+            width: 15rem;
+            padding: 0.25rem 0;
+            overflow: hidden;
+        }
+        .menu-item {
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            line-height: 1.25rem;
+            text-align: left;
+            color: #fff;
+            background: transparent;
+            border: 0;
+            transition: background-color 0.15s;
+        }
+        .menu-item:hover { background: rgba(255, 255, 255, 0.12); }
+        .menu-item.danger { color: var(--red-400); }
+        .menu-item.restore { color: var(--blue-300); }
+        .menu-sep {
+            height: 1px;
+            margin: 0.25rem 0;
+            border: 0;
+            background: var(--ui-border);
+        }
+        .menu-compact {
+            flex-direction: row;
+            align-items: center;
+            gap: 0.75rem;
+            width: 14rem;
+            padding: 0.75rem 1rem;
+        }
+        .menu-compact input[type="range"] { flex: 1; min-width: 0; accent-color: var(--blue-500); cursor: pointer; }
+        .menu-compact output {
+            min-width: 2.75rem;
+            font-size: 0.875rem;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ------------------------------------------------------------------
+         * EDGE TOOLS
+         * One small floating toolbar (drag grip, plus "open in new tab" on
+         * the address panel) that attaches to whichever panel the pointer is
+         * over, on the side nearest the pointer. Positioned by JS.
+         * ------------------------------------------------------------------ */
+        #edge-tools {
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 130;
+            display: flex;
+            gap: 2px;
+            padding: 2px;
+            background: var(--gray-800);
+            border: 1px solid var(--ui-border);
+            border-radius: 9999px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s;
+        }
+        #edge-tools.is-visible { opacity: 1; pointer-events: auto; }
+        #edge-tools[data-edge="left"], #edge-tools[data-edge="right"] { flex-direction: column; }
+        .edge-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            color: var(--gray-300);
+            background: transparent;
+            border: 0;
+            border-radius: 9999px;
+            transition: color 0.15s, background-color 0.15s;
+        }
+        .edge-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+        #edge-grip { cursor: grab; touch-action: none; user-select: none; }
+        #edge-grip:active { cursor: grabbing; }
+        #edge-tools[data-edge="left"] #edge-grip svg,
+        #edge-tools[data-edge="right"] #edge-grip svg { transform: rotate(90deg); }
+
+        /* ------------------------------------------------------------------
+         * LAYER 2: FLOATING SLIDE LABELS (text is fitted to the box)
+         * ------------------------------------------------------------------ */
+        #label-container {
+            position: absolute;
+            inset: 0;
+            pointer-events: none; /* Clicks fall through to the iframe */
             z-index: 50;
         }
         .dashboard-label {
-            position: absolute;
-            pointer-events: auto; /* Catches clicks for dragging/editing */
-            background-color: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(4px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 8px;
-            color: white;
             display: flex;
             flex-direction: column;
+            min-width: 60px;
+            min-height: 30px;
+            pointer-events: auto;
+        }
+        .dashboard-label:not(.active) {
             opacity: 0;
-            transition: opacity 0.5s;
-            resize: both; /* Native browser resize handle */
-            overflow: hidden;
-            min-width: 120px;
-            min-height: 40px;
-        }
-        .dashboard-label.active {
-            opacity: 1; /* Made visible when corresponding iframe is active */
-        }
-        .label-header {
-            background: rgba(255,255,255,0.1);
-            height: 24px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            pointer-events: none; /* Invisible labels must not block the page */
         }
         .label-content {
-            padding: 8px 12px;
             flex-grow: 1;
-            font-size: 1.25rem;
-            font-weight: bold;
+            min-height: 0;
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 4px 12px;
+            overflow: hidden;
+            font-size: 1.25rem;
+            font-weight: 700;
+            line-height: 1.15;
             text-align: center;
-            word-wrap: break-word;
+            overflow-wrap: normal; /* Long words shrink the text instead of breaking */
+            cursor: text;
         }
-        /* Visual cue for editable text */
-        .label-content[contenteditable="true"] { cursor: text; }
-        .label-content[contenteditable="true"]:focus {
-            outline: 1px dashed rgba(255,255,255,0.5);
-            background-color: rgba(0,0,0,0.4);
+        .label-content:focus {
+            outline: 1px dashed rgba(255, 255, 255, 0.5);
+            outline-offset: -2px;
+            background-color: rgba(0, 0, 0, 0.4);
             border-radius: 4px;
         }
 
-        /* Queue Overlay Panel */
+        /* ------------------------------------------------------------------
+         * LAYER 3: QUEUE PANEL
+         * Sizes are in em, so fitQueueText() can scale everything at once by
+         * changing the panel's font size.
+         * ------------------------------------------------------------------ */
         #queue-overlay {
-            position: absolute;
-            background-color: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(8px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 8px;
-            padding: 12px;
+            top: 24px;
+            right: 24px;
             z-index: 55;
             display: flex;
             flex-direction: column;
-            gap: 8px;
-            min-width: 150px;
-            transition: opacity 0.3s;
-            pointer-events: auto;
+            gap: 0.5em;
+            min-width: 100px;
+            min-height: 56px;
+            max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px);
+            padding: 0.85em;
+            font-size: 14px;
+        }
+        .queue-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            flex-shrink: 0;
+            padding-bottom: 0.3em;
+            border-bottom: 1px solid var(--ui-border);
+        }
+        .queue-title {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            font-size: 0.857em;
+            line-height: 1.33;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--gray-400);
+        }
+        .icon-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            width: 1.6em;
+            height: 1.6em;
+            padding: 0;
+            color: var(--gray-400);
+            background: transparent;
+            border: 0;
+            border-radius: 0.4em;
+            transition: color 0.15s, background-color 0.15s;
+        }
+        .icon-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+        .icon-btn svg { width: 1.05em; height: 1.05em; }
+        #queue-list {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.15em;
+            overflow-y: auto;
+            user-select: none;
         }
         .queue-item {
-            font-size: 0.875rem;
-            color: #9ca3af;
-            transition: color 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 0.3em;
+            flex-shrink: 0;
+            padding: 0.15em 0.45em 0.15em 0.15em;
+            white-space: nowrap;
+            color: var(--gray-400);
+            border-radius: 0.3em;
+            cursor: pointer;
+            transition: color 0.3s, background-color 0.15s;
         }
+        .queue-item:hover { background-color: rgba(255, 255, 255, 0.08); }
+        .queue-item > .queue-text {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Per-row reorder grip, shown while hovering that row. */
+        .queue-handle {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            width: 1em;
+            height: 1.43em;
+            color: var(--gray-400);
+            cursor: grab;
+            touch-action: none; /* Drag to reorder on touchscreens */
+            opacity: 0;
+            transition: opacity 0.15s, color 0.15s;
+        }
+        .queue-handle svg { width: 0.72em; height: 1.15em; }
+        .queue-handle:hover { color: #fff; }
+        .queue-item:hover > .queue-handle,
+        .queue-item.is-dragging > .queue-handle { opacity: 1; }
         .queue-item.active {
             color: #fff;
-            font-weight: bold;
+            font-weight: 700;
+        }
+        .queue-item.is-dragging {
+            color: #fff;
+            background-color: rgba(59, 130, 246, 0.4);
+            cursor: grabbing;
         }
 
-        /* Custom Scrollbar for Settings Modal */
+        /* ------------------------------------------------------------------
+         * LAYER 3b: CURRENT ADDRESS (bottom center by default)
+         * Centered with calc() instead of a transform, so resizing from the
+         * corner grows it to the right like every other panel.
+         * ------------------------------------------------------------------ */
+        #url-panel {
+            --url-width: clamp(240px, calc(100vw - 1040px), 560px);
+            bottom: 24px;
+            left: calc(50% - var(--url-width) / 2);
+            z-index: 58;
+            display: flex;
+            align-items: center;
+            width: var(--url-width);
+            min-width: 100px;
+            min-height: 26px;
+            max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px);
+            padding: 0.45em 0.9em;
+            font-size: 13px;
+            color: var(--gray-300);
+            cursor: copy;
+        }
+        #url-text {
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: var(--url-lines, 1);
+            overflow: hidden;
+            overflow-wrap: anywhere;
+            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+            line-height: 1.35;
+        }
+        #url-panel.is-stale #url-text { font-style: italic; color: var(--gray-400); }
+        #url-panel.is-copied { color: var(--green-300); }
+        #url-panel.is-copy-failed { color: var(--red-400); }
+
+        /* ------------------------------------------------------------------
+         * LAYER 4: SETTINGS DIALOG
+         * Same panel frame as everything else, opaque so the form is easy to
+         * read. Its layout follows its own width (container queries), so it
+         * can be resized like any other panel.
+         * ------------------------------------------------------------------ */
+        #settings-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.6);
+        }
+        #settings-panel {
+            --surface: #16181d;
+            --surface-hover: #1b1e24;
+            --field: #0f1115;
+            --line: rgba(255, 255, 255, 0.08);
+            --line-strong: rgba(255, 255, 255, 0.14);
+            --text: #e7e8ea;
+            --muted: #8d939c;
+            --faint: #5f656e;
+            --accent: #3b82f6;
+            --danger: #f05252;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            width: min(760px, 100%);
+            min-width: 300px;
+            min-height: 260px;
+            max-width: calc(100vw - 2rem);
+            max-height: calc(100vh - 2rem);
+            overflow: hidden;
+            font-size: 13px;
+            line-height: 1.45;
+            color: var(--text);
+            background-color: var(--surface);
+            container-type: inline-size;
+        }
+        #settings-panel :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+        .dialog-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-shrink: 0;
+            padding: 10px 10px 10px 20px;
+            border-bottom: 1px solid var(--line);
+        }
+        .dialog-header h2 {
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+        .dialog-body {
+            flex: 1;
+            min-height: 0;
+            padding: 0 20px;
+            overflow-y: auto;
+        }
+        .dialog-footer {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+            padding: 10px 16px 10px 10px;
+            border-top: 1px solid var(--line);
+        }
+
+        .settings-section { padding: 18px 0; }
+        .settings-section + .settings-section { border-top: 1px solid var(--line); }
+        .section-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 4px 16px;
+            margin-bottom: 8px;
+        }
+        .section-title { font-size: 13px; font-weight: 600; }
+        .section-title .count {
+            margin-left: 6px;
+            font-weight: 500;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+        .section-hint { font-size: 12px; color: var(--muted); }
+
+        .field-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+            padding: 10px 0;
+        }
+        .field-row + .field-row { border-top: 1px solid var(--line); }
+        .field-name {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-weight: 500;
+        }
+        .field-help { font-size: 12px; font-weight: 400; color: var(--muted); }
+        .field-control { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+        .input-affix {
+            display: flex;
+            align-items: center;
+            height: 32px;
+            background: var(--field);
+            border: 1px solid var(--line-strong);
+            border-radius: 6px;
+        }
+        .input-affix:focus-within { border-color: var(--accent); }
+        .input-affix input {
+            width: 64px;
+            height: 100%;
+            padding: 0 4px 0 10px;
+            text-align: right;
+            background: transparent;
+            border: 0;
+            outline: none;
+            font-variant-numeric: tabular-nums;
+        }
+        .input-affix .affix { padding: 0 10px 0 2px; color: var(--muted); }
+        .slider-control input[type="range"] { width: 180px; accent-color: var(--accent); cursor: pointer; }
+        .slider-value {
+            min-width: 3em;
+            text-align: right;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Slides table */
+        .slide-table {
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+        }
+        .slide-row, .slide-table-head {
+            display: grid;
+            grid-template-columns: 28px 22px minmax(0, 1fr) minmax(0, 1.7fr) 30px;
+            grid-template-areas: "handle index label url remove";
+            align-items: center;
+            column-gap: 6px;
+            padding: 3px 6px;
+        }
+        .slide-table-head {
+            padding-block: 7px;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--muted);
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--line);
+        }
+        .slide-table-head > :nth-child(3) { grid-area: label; padding-left: 9px; }
+        .slide-table-head > :nth-child(4) { grid-area: url; padding-left: 9px; }
+        .slide-row {
+            background: var(--surface);
+            transition: background-color 0.15s;
+        }
+        .slide-row + .slide-row { border-top: 1px solid var(--line); }
+        .slide-row:hover { background: var(--surface-hover); }
+        .slide-row.is-current {
+            background: rgba(59, 130, 246, 0.08);
+            box-shadow: inset 2px 0 0 var(--accent);
+        }
+        .slide-row.is-dragging {
+            position: relative;
+            z-index: 1;
+            background: #20242b;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+        }
+        .row-handle { grid-area: handle; }
+        .row-index {
+            grid-area: index;
+            font-size: 12px;
+            text-align: right;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+        .cell-label { grid-area: label; }
+        .cell-url { grid-area: url; }
+        .row-remove { grid-area: remove; }
+        .cell-input {
+            width: 100%;
+            min-width: 0;
+            height: 30px;
+            padding: 0 8px;
+            color: var(--text);
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            text-overflow: ellipsis;
+            transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+        }
+        .cell-input::placeholder { color: var(--faint); }
+        .cell-input:hover { border-color: var(--line-strong); }
+        .cell-input:focus { outline: none; background: var(--field); border-color: var(--accent); }
+        .cell-input.invalid { border-color: var(--danger); }
+        /* Addresses are secondary to labels: monospace, a step quieter until edited. */
+        .cell-url {
+            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .cell-url:focus { color: var(--text); }
+        .row-handle, .row-remove, .icon-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            color: var(--muted);
+            background: transparent;
+            border: 0;
+            border-radius: 6px;
+            transition: color 0.15s, background-color 0.15s, opacity 0.15s;
+        }
+        .row-handle { cursor: grab; touch-action: none; }
+        .row-handle:active { cursor: grabbing; }
+        .row-handle svg { width: 10px; height: 16px; }
+        .row-remove { opacity: 0; }
+        .row-remove svg { width: 15px; height: 15px; }
+        .slide-row:hover .row-remove,
+        .slide-row:focus-within .row-remove { opacity: 1; }
+        .row-handle:hover, .icon-button:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+        .row-remove:hover { color: var(--danger); background: rgba(240, 82, 82, 0.12); }
+        .icon-button svg { width: 16px; height: 16px; }
+        .slide-empty { padding: 20px; text-align: center; color: var(--muted); }
+        .slide-add {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            height: 38px;
+            padding: 0 14px;
+            color: var(--muted);
+            background: transparent;
+            border: 0;
+            border-top: 1px solid var(--line);
+            text-align: left;
+            transition: color 0.15s, background-color 0.15s;
+        }
+        .slide-add:hover { color: var(--text); background: rgba(255, 255, 255, 0.03); }
+        .slide-add svg { width: 14px; height: 14px; }
+        .footnote { margin-top: 10px; font-size: 12px; color: var(--muted); }
+        .about { padding: 2px 0 18px; font-size: 12px; color: var(--faint); }
+        .footnote a, .about a {
+            color: var(--muted);
+            text-decoration: underline;
+            text-decoration-color: var(--line-strong);
+            text-underline-offset: 2px;
+        }
+        .footnote a:hover, .about a:hover { color: var(--text); text-decoration-color: currentColor; }
+        .status {
+            flex: 1;
+            min-width: 0;
+            padding: 0 8px;
+            overflow: hidden;
+            font-size: 12px;
+            color: var(--muted);
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .status.is-error { color: var(--danger); }
+
+        /* Buttons (settings dialog and empty state) */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 32px;
+            padding: 0 14px;
+            font-size: 13px;
+            font-weight: 500;
+            white-space: nowrap;
+            color: #e7e8ea;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+        }
+        .btn-primary { color: #fff; background: #3b82f6; }
+        .btn-primary:hover { background: #2f6fdc; }
+        .btn-secondary { border-color: rgba(255, 255, 255, 0.14); }
+        .btn-secondary:hover { background: rgba(255, 255, 255, 0.06); }
+        .btn-quiet { padding: 0 10px; color: #8d939c; }
+        .btn-quiet:hover { color: #e7e8ea; background: rgba(255, 255, 255, 0.06); }
+        .btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
+
+        @container (max-width: 560px) {
+            .slide-row {
+                grid-template-columns: 28px minmax(0, 1fr) 30px;
+                grid-template-areas: "handle label remove" "handle url remove";
+                row-gap: 2px;
+                padding-block: 5px;
+            }
+            .row-index, .slide-table-head { display: none; }
+        }
+        @container (max-width: 460px) {
+            .field-row { flex-direction: column; align-items: stretch; gap: 8px; }
+            .slider-control input[type="range"] { flex: 1; width: auto; }
+        }
+
+        /* Touchscreens can't hover: keep row grips and resize corners available. */
+        @media (hover: none) {
+            .queue-handle { opacity: 1; }
+            .resizable { resize: both; }
+        }
+
+        /* Scrollbars inside the settings dialog and queue */
         ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1f2937; }
-        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--gray-600); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--gray-500); }
     </style>
 </head>
 <body>
+    <h1 class="visually-hidden">SiteRover</h1>
 
-    <!-- LAYER 1: Iframes -->
+    <!-- Icons used more than once -->
+    <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <symbol id="icon-grip-h" viewBox="0 0 16 10">
+            <circle cx="3" cy="2.5" r="1.5"/><circle cx="8" cy="2.5" r="1.5"/><circle cx="13" cy="2.5" r="1.5"/>
+            <circle cx="3" cy="7.5" r="1.5"/><circle cx="8" cy="7.5" r="1.5"/><circle cx="13" cy="7.5" r="1.5"/>
+        </symbol>
+        <symbol id="icon-grip-v" viewBox="0 0 10 16">
+            <circle cx="2.5" cy="3" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="2.5" cy="13" r="1.5"/>
+            <circle cx="7.5" cy="3" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="7.5" cy="13" r="1.5"/>
+        </symbol>
+        <symbol id="icon-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"/>
+        </symbol>
+        <symbol id="icon-trash" viewBox="0 0 20 20">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z"/>
+        </symbol>
+    </svg>
+
+    <!-- LAYER 1: one iframe per slide -->
     <div id="iframe-container"></div>
-    
-    <!-- LAYER 2: Floating Labels -->
+    <div id="empty-state" hidden>
+        <div class="empty-card panel">
+            <h2>No sites to show yet</h2>
+            <p id="empty-message"></p>
+            <div class="btn-group">
+                <button type="button" id="btn-empty-import" class="btn btn-primary">Import a config file</button>
+                <button type="button" id="btn-empty-settings" class="btn btn-secondary">Open Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- LAYER 2: floating, editable slide labels -->
     <div id="label-container"></div>
 
-    <!-- LAYER 3: Queue Overlay -->
-    <div id="queue-overlay" class="hidden">
-        <div class="drag-handle w-full" id="queue-drag-handle" title="Drag to move panel">
-            <!-- '≡' Hamburger Handle -->
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
-                <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
-            </svg>
-        </div>
-        <h3 class="text-xs font-bold text-gray-400 mb-1 uppercase tracking-wider border-b border-gray-600 pb-1">Upcoming Sequence</h3>
-        <div id="queue-list" class="flex flex-col gap-1"></div>
-    </div>
-
-    <!-- LAYER 4: Main Control Panel -->
-    <div id="control-panel">
-        <div class="drag-handle" title="Drag to move panel" id="panel-drag-handle">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
-                <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
-            </svg>
-        </div>
-        
-        <!-- Settings -->
-        <button id="btn-settings" class="control-btn" title="Dashboard Settings">
-            <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-                <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-            </svg>
-        </button>
-
-        <!-- Reload Menu -->
-        <div class="relative flex items-center justify-center">
-            <button id="btn-reload-toggle" class="control-btn" title="Reload / Restore Options">
-                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+    <!-- LAYER 3: queue panel -->
+    <aside id="queue-overlay" class="panel floating resizable" aria-label="Slide queue" hidden>
+        <div class="queue-header">
+            <span class="queue-title">Upcoming Sequence</span>
+            <button type="button" id="btn-queue-edit" class="icon-btn" title="Edit slides" aria-label="Edit slides">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487z"/>
                 </svg>
             </button>
-            
-            <!-- Dropdown Container -->
-            <div id="reload-dropdown" class="hidden absolute bottom-full mb-3 left-1/2 -translate-x-1/2 bg-gray-900 border border-gray-600 rounded-lg shadow-2xl flex flex-col overflow-hidden w-48 py-1 z-[110]">
-                <button id="btn-reload-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-white transition-colors">Reload Current</button>
-                <button id="btn-reset-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-red-400 transition-colors" title="Hard refresh (bypass cache)">Reset Current (Hard)</button>
-                <div class="w-full h-px bg-gray-700 my-1"></div>
-                <button id="btn-reload-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-white transition-colors">Reload All URLs</button>
-                <button id="btn-reset-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-red-400 transition-colors" title="Hard refresh all (bypass cache)">Reset All (Hard)</button>
-                <div class="w-full h-px bg-gray-700 my-1"></div>
-                <button id="btn-restore-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-blue-300 transition-colors" title="Restore layout from baseline config">Restore Current Layout</button>
-                <button id="btn-restore-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-blue-300 transition-colors" title="Restore all panel layouts from baseline config">Restore All Layouts</button>
-            </div>
         </div>
+        <div id="queue-list"></div>
+    </aside>
 
-        <!-- Mute -->
-        <button id="btn-mute" class="control-btn" title="Mute/Unmute iframes">
-            <svg id="icon-unmuted" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5 10v4a2 2 0 002 2h2.586l3.707 3.707A1 1 0 0015 19V5a1 1 0 00-1.707-.707L9.586 8H7a2 2 0 00-2 2z"></path>
-            </svg>
-            <svg id="icon-muted" class="hidden text-red-400" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"></path>
-                <path stroke-linecap="round" stroke-linejoin="round" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"></path>
-            </svg>
-        </button>
+    <!-- LAYER 3b: address of the current slide; click to copy -->
+    <div id="url-panel" class="panel floating resizable" role="button" tabindex="0" aria-label="Address of the current slide. Click to copy." hidden>
+        <span id="url-text"></span>
+    </div>
 
-        <!-- Toggle Queue -->
-        <button id="btn-toggle-queue" class="control-btn" title="Toggle Queue Visibility">
-            <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h7"></path>
+    <!-- LAYER 4: main control panel -->
+    <div id="control-panel" class="panel floating resizable" role="toolbar" aria-label="SiteRover controls">
+        <button type="button" id="btn-settings" class="control-btn" title="Settings" aria-label="Settings">
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
             </svg>
         </button>
-
-        <!-- Playback Controls -->
-        <button id="btn-prev" class="control-btn" title="Previous Slide">
-            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"></path>
+        <button type="button" id="btn-opacity" class="control-btn" title="Panel transparency" aria-label="Panel transparency" aria-expanded="false" aria-controls="opacity-popover">
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/>
             </svg>
         </button>
-        <button id="btn-playpause" class="control-btn" title="Pause / Resume">
-            <svg id="icon-pause" width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path>
-            </svg>
-            <svg id="icon-play" class="hidden" width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M8 5v14l11-7z"></path>
+        <button type="button" id="btn-reload-toggle" class="control-btn" title="Reload / layout options" aria-label="Reload and layout options" aria-expanded="false" aria-controls="reload-dropdown">
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
             </svg>
         </button>
-        <button id="btn-next" class="control-btn" title="Next Slide">
-            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"></path>
+        <button type="button" id="btn-open-tab" class="control-btn" title="Open this slide in a new tab" aria-label="Open this slide in a new tab">
+            <svg aria-hidden="true"><use href="#icon-open"></use></svg>
+        </button>
+        <button type="button" id="btn-mute" class="control-btn" title="Mute / unmute (YouTube embeds with enablejsapi=1 only)" aria-label="Mute" aria-pressed="false">
+            <svg id="icon-unmuted" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5 10v4a2 2 0 002 2h2.586l3.707 3.707A1 1 0 0015 19V5a1 1 0 00-1.707-.707L9.586 8H7a2 2 0 00-2 2z"/>
+            </svg>
+            <svg id="icon-muted" class="icon-muted" hidden fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"/>
+            </svg>
+        </button>
+        <button type="button" id="btn-toggle-queue" class="control-btn" title="Show / hide the queue panel" aria-label="Show or hide the queue panel" aria-expanded="false" aria-controls="queue-menu">
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h7"/>
+            </svg>
+        </button>
+        <button type="button" id="btn-prev" class="control-btn" title="Previous slide" aria-label="Previous slide">
+            <svg fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"/>
+            </svg>
+        </button>
+        <button type="button" id="btn-playpause" class="control-btn" title="Pause rotation" aria-label="Pause rotation">
+            <svg id="icon-pause" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+            </svg>
+            <svg id="icon-play" hidden fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 5v14l11-7z"/>
+            </svg>
+        </button>
+        <button type="button" id="btn-next" class="control-btn" title="Next slide" aria-label="Next slide">
+            <svg fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/>
             </svg>
         </button>
     </div>
 
-    <!-- LAYER 5: Settings Modal -->
-    <div id="settings-modal" class="fixed inset-0 bg-black bg-opacity-80 z-[100] flex items-center justify-center p-4 hidden">
-        <div id="settings-panel" class="bg-gray-800 rounded-xl p-6 w-full max-w-4xl shadow-2xl flex flex-col max-h-[90vh] relative">
-            <div class="drag-handle w-full absolute top-2 left-0 right-0 h-6" id="settings-drag-handle" title="Drag to move panel">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
-                    <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
-                </svg>
-            </div>
-            
-            <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 mt-4 text-white">Dashboard Configuration</h2>
-            
-            <div class="flex-1 overflow-y-auto mb-4 pr-2">
-                <!-- Requirement Notice -->
-                <div class="mb-6 p-3 bg-blue-900 border border-blue-700 text-blue-100 text-sm rounded">
-                    <strong>Critical Requirement:</strong> To embed external sites that enforce strictly framed security policies (like <em>zoom.earth</em>), you <strong>must</strong> use a browser extension to strip security headers locally. 
-                    <a href="https://github.com/ThomazPom/Moz-Ext-Ignore-X-Frame-Options" target="_blank" rel="noopener noreferrer" class="text-blue-300 hover:text-white underline font-bold">Install Ignore X-Frame-Options (Firefox)</a> or a similar FOSS extension.
-                </div>
+    <!-- Menus for control panel buttons (placed next to their button by JS) -->
+    <div id="opacity-popover" class="menu menu-compact panel" hidden>
+        <label class="visually-hidden" for="quick-opacity">Panel opacity</label>
+        <input type="range" id="quick-opacity" min="0.1" max="1" step="0.05">
+        <output id="quick-opacity-val" for="quick-opacity"></output>
+    </div>
+    <div id="reload-dropdown" class="menu panel" hidden>
+        <button type="button" id="btn-reload-current" class="menu-item">Reload Current</button>
+        <button type="button" id="btn-reset-current" class="menu-item danger" title="Reload, bypassing the browser cache">Reset Current (Hard)</button>
+        <hr class="menu-sep">
+        <button type="button" id="btn-reload-all" class="menu-item">Reload All URLs</button>
+        <button type="button" id="btn-reset-all" class="menu-item danger" title="Reload every slide, bypassing the browser cache">Reset All (Hard)</button>
+        <hr class="menu-sep">
+        <button type="button" id="btn-layout-to-all" class="menu-item" title="Copy where this slide's panels and label sit to every slide">Use This Layout on All Slides</button>
+        <button type="button" id="btn-restore-current" class="menu-item restore" title="Put this slide's panels and label back where the config file had them">Restore Current Layout</button>
+        <button type="button" id="btn-restore-all" class="menu-item restore" title="Put every panel and label back where the config file had them">Restore All Layouts</button>
+    </div>
+    <div id="queue-menu" class="menu panel" hidden>
+        <button type="button" id="btn-queue-current" class="menu-item">Hide Queue on This Slide</button>
+        <button type="button" id="btn-queue-all" class="menu-item">Hide Queue on All Slides</button>
+    </div>
 
-                <!-- Global Settings -->
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-300 mb-2">Rotation Interval (Seconds)</label>
-                        <div class="flex gap-2">
-                            <input type="number" id="input-interval" class="flex-1 bg-gray-900 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" min="1">
+    <!-- Floating tools for the hovered panel (see EDGE TOOLS in the script) -->
+    <div id="edge-tools">
+        <div id="edge-grip" class="edge-btn" title="Drag to move">
+            <svg width="16" height="10" fill="currentColor" aria-hidden="true"><use href="#icon-grip-h"></use></svg>
+        </div>
+        <button type="button" id="edge-open" class="edge-btn" title="Open this slide in a new tab" aria-label="Open this slide in a new tab" hidden>
+            <svg width="16" height="16" aria-hidden="true"><use href="#icon-open"></use></svg>
+        </button>
+    </div>
+
+    <!-- LAYER 5: settings dialog -->
+    <div id="settings-modal" hidden>
+        <div id="settings-panel" class="panel resizable" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <header class="dialog-header">
+                <h2 id="settings-title">Settings</h2>
+                <button type="button" id="btn-close-settings" class="icon-button" title="Close without saving (Esc)" aria-label="Close without saving">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+            </header>
+
+            <div class="dialog-body">
+                <section class="settings-section" aria-labelledby="section-playback">
+                    <div class="section-head">
+                        <h3 id="section-playback" class="section-title">Playback</h3>
+                    </div>
+                    <div class="field-row">
+                        <label class="field-name" for="input-interval">
+                            Time per slide
+                            <span class="field-help">How long each page stays on screen before the next one.</span>
+                        </label>
+                        <div class="field-control">
+                            <span class="input-affix">
+                                <input type="number" id="input-interval" min="1" step="1">
+                                <span class="affix">sec</span>
+                            </span>
                         </div>
                     </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-300 mb-2">UI Transparency</label>
-                        <div class="flex flex-col gap-2 bg-gray-900 p-3 rounded border border-gray-700">
-                            <div class="flex justify-between items-center mb-1">
-                                <span class="text-xs text-gray-400">Opacity Level</span>
-                                <span id="opacity-val" class="bg-gray-800 px-2 py-0.5 rounded text-xs"></span>
-                            </div>
-                            <input type="range" id="input-opacity" min="0.1" max="1" step="0.05" class="w-full cursor-pointer">
+                    <div class="field-row">
+                        <label class="field-name" for="input-opacity">
+                            Panel opacity
+                            <span class="field-help">How visible panels and labels are while the pointer is elsewhere.</span>
+                        </label>
+                        <div class="field-control slider-control">
+                            <input type="range" id="input-opacity" min="0.1" max="1" step="0.05">
+                            <output id="opacity-val" class="slider-value" for="input-opacity"></output>
                         </div>
                     </div>
-                </div>
+                </section>
 
-                <!-- URL Items List -->
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-300 mb-2">Slideshow Items (URLs & Labels)</label>
-                    <div id="item-list" class="space-y-3 mb-4">
-                        <!-- Populated dynamically via JS -->
+                <section class="settings-section" aria-labelledby="section-slides">
+                    <div class="section-head">
+                        <h3 id="section-slides" class="section-title">Slides<span id="slide-count" class="count"></span></h3>
+                        <span class="section-hint">Drag a row by its handle, or focus the handle and use the arrow keys.</span>
                     </div>
-                    
-                    <!-- Add New Item -->
-                    <div class="bg-gray-900 border border-gray-700 rounded p-4">
-                        <h4 class="text-sm font-bold text-gray-400 mb-2">Add New Sequence Item</h4>
-                        <div class="flex flex-col md:flex-row gap-2">
-                            <input type="text" id="new-url" class="flex-[2] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" placeholder="Valid URL (https://...)">
-                            <input type="text" id="new-label" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" placeholder="Display Label">
-                            <button id="btn-add-item" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors whitespace-nowrap">Add Item</button>
+                    <div class="slide-table">
+                        <div class="slide-table-head" aria-hidden="true">
+                            <span></span><span></span><span>Label</span><span>Address</span><span></span>
                         </div>
+                        <div id="item-list" role="list" aria-labelledby="section-slides"></div>
+                        <button type="button" id="btn-add-item" class="slide-add">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                            Add slide
+                        </button>
                     </div>
-                </div>
+                    <p class="footnote">
+                        Some sites refuse to be shown inside other pages and stay blank.
+                        <a href="https://github.com/alexis-nieto/site-rover#sites-that-refuse-to-load" target="_blank" rel="noopener noreferrer">Why this happens and what you can do</a>
+                    </p>
+                </section>
+
+                <p class="about">
+                    SiteRover <span id="app-version"></span> · Free software (GPL-3.0) ·
+                    <a href="https://github.com/alexis-nieto/site-rover" target="_blank" rel="noopener noreferrer">Source code and documentation</a>
+                </p>
             </div>
 
-            <!-- Action Buttons -->
-            <div class="border-t border-gray-700 pt-4 flex flex-wrap justify-between gap-2">
-                <div class="flex gap-2">
-                    <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors text-sm" title="Download Live Config as JSON">Export Config</button>
-                    <label for="input-import" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors text-sm cursor-pointer inline-flex items-center" title="Upload JSON Config (Becomes new Baseline)">
-                        Import Config
-                    </label>
-                    <input type="file" id="input-import" accept=".json" class="hidden">
-                </div>
-                <div class="flex gap-2">
-                    <button id="btn-cancel" class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded transition-colors">Discard</button>
-                    <button id="btn-save" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded font-semibold transition-colors">Save & Apply</button>
-                </div>
-            </div>
+            <footer class="dialog-footer">
+                <button type="button" id="btn-import" class="btn btn-quiet" title="Load slides and layout from a JSON file">Import…</button>
+                <button type="button" id="btn-export" class="btn btn-quiet" title="Save these settings as a JSON file">Export…</button>
+                <input type="file" id="input-import" accept=".json,application/json" aria-label="Config file to import" hidden>
+                <p id="settings-status" class="status" role="status" aria-live="polite"></p>
+                <button type="button" id="btn-cancel" class="btn btn-secondary">Cancel</button>
+                <button type="button" id="btn-save" class="btn btn-primary">Save</button>
+            </footer>
         </div>
     </div>
 
     <script>
+        'use strict';
+
         /**
          * @typedef {Object} ElementStyle
-         * @property {string} top
-         * @property {string} left
-         * @property {string} bottom
-         * @property {string} right
+         * CSS position/size of a panel or label. Values are CSS lengths ("24px", "10%", "auto").
+         * @property {string} [top]
+         * @property {string} [left]
+         * @property {string} [bottom]
+         * @property {string} [right]
          * @property {string} [width]
          * @property {string} [height]
          */
 
         /**
          * @typedef {Object} DashboardItem
-         * @property {string} url - The external site URL to load in the iframe.
-         * @property {string} label - The text displayed on the draggable floating label.
-         * @property {ElementStyle} style - Coordinates and dimensions of the label.
+         * @property {string} url - Page to load in the slide's iframe (http, https or file).
+         * @property {string} label - Text of the floating label. Empty string = no label.
+         * @property {ElementStyle} style - Position and size of the floating label.
+         * @property {ElementStyle} [panelPos] - Control panel position/size on this slide (default: global).
+         * @property {ElementStyle} [queuePos] - Queue panel position/size on this slide (default: global).
+         * @property {ElementStyle} [urlPos] - Address panel position/size on this slide (default: global).
+         * @property {boolean} [showQueue] - Queue visibility on this slide (default: global showQueue).
          */
 
         /**
          * @typedef {Object} DashboardConfig
-         * @property {number} intervalSeconds - Time each iframe stays active.
-         * @property {number} uiOpacity - Transparency level for UI elements.
-         * @property {boolean} showQueue - Whether the queue panel is visible.
-         * @property {ElementStyle} panelPos - Coordinates of the main control panel.
-         * @property {ElementStyle} queuePos - Coordinates of the queue overlay.
-         * @property {ElementStyle|null} settingsPos - Coordinates of the settings modal.
-         * @property {DashboardItem[]} items - Array of URLs and their associated labels.
+         * @property {number} version - Config schema version (currently 1).
+         * @property {number} intervalSeconds - How long each slide stays on screen.
+         * @property {number} uiOpacity - Opacity of panels and labels at rest, 0.1 to 1.
+         * @property {boolean} showQueue - Whether the queue panel is visible (unless a slide says otherwise).
+         * @property {ElementStyle} panelPos - Default position/size of the control panel.
+         * @property {ElementStyle} queuePos - Default position/size of the queue panel.
+         * @property {ElementStyle|null} urlPos - Default position/size of the address panel (null = bottom center).
+         * @property {ElementStyle|null} settingsPos - Position/size of the settings dialog (null = centered).
+         * @property {DashboardItem[]} items - The slides, in rotation order.
+         */
+
+        /**
+         * @typedef {Object} Slide
+         * Everything on screen for one item. Code refers to slides by object, never
+         * by position, so reordering is just reordering the `slides` array.
+         * @property {DashboardItem} item - The same object as in liveConfig.items.
+         * @property {HTMLIFrameElement} frame
+         * @property {HTMLElement|null} label - null when the item has no label text.
+         * @property {HTMLElement} queueItem - The row in the queue panel.
+         * @property {HTMLElement} queueText - The text inside that row.
+         * @property {number} pendingLoads - Iframe loads SiteRover itself started and still expects.
+         * @property {boolean} navigated - The page navigated on its own (link clicked inside it, etc.).
+         * @property {string|null} currentUrl - Real address, when the browser lets us read it (same origin only).
+         */
+
+        /**
+         * @typedef {Object} EdgePanel
+         * A panel that shows the floating edge tools while hovered.
+         * @property {HTMLElement} el
+         * @property {() => void} onDragEnd - Saves the panel's new position.
+         * @property {boolean} [resizable] - Pinned to pixel coordinates on hover, so its resize corner tracks the pointer.
+         * @property {boolean} [canOpen] - Also offer "open in new tab".
          */
 
         // ----------------------------------------------------------------------
-        // STATE MANAGEMENT
+        // CONSTANTS
         // ----------------------------------------------------------------------
-        const STORAGE_KEY_LIVE = 'tvDashboardLiveV4';
-        const STORAGE_KEY_BASELINE = 'tvDashboardBaselineV4';
 
-        /** @type {DashboardConfig} Default initial configuration. */
+        /** Replaced by the release and Pages workflows (e.g. 'v1.2.0'); see .github/workflows/. */
+        const VERSION = 'dev';
+
+        const CONFIG_VERSION = 1;
+        /** Loaded on start unless the page URL names another, e.g. index.html?config=lobby.json */
+        const DEFAULT_CONFIG_FILE = 'config.json';
+        const CONFIG_FETCH_TIMEOUT_MS = 10000;
+        /** Each config file gets its own saved state, so several screens or widgets can share one site. */
+        const STORAGE_PREFIX = 'siterover.v1:';
+        /** Keys used by the pre-release prototype; read once so existing setups carry over. */
+        const LEGACY_STORAGE_KEYS = { live: 'tvDashboardLiveV4', baseline: 'tvDashboardBaselineV4' };
+
+        /**
+         * Only these URL schemes may be loaded into a slide. `javascript:` and `data:`
+         * URLs are refused because a shared config could use them to run code inside
+         * SiteRover itself.
+         */
+        const ALLOWED_PROTOCOLS = ['http:', 'https:', 'file:'];
+        const MIN_INTERVAL_SECONDS = 1;
+        const MIN_OPACITY = 0.1;
+        const DEFAULT_LABEL_STYLE = { top: '20px', left: '20px', width: '250px', height: '60px' };
+
+        /** Panels whose position (and size) can differ per slide, and the element each key controls. */
+        const PANEL_KEYS = ['panelPos', 'queuePos', 'urlPos'];
+        const PANEL_ELEMENT_IDS = { panelPos: 'control-panel', queuePos: 'queue-overlay', urlPos: 'url-panel' };
+        const GEOMETRY_PROPS = ['top', 'left', 'bottom', 'right', 'width', 'height', 'transform'];
+
+        // Fitting contents to resized panels
+        const MIN_TEXT_PX = 8;
+        const MAX_QUEUE_FONT_PX = 48;
+        const MAX_URL_FONT_PX = 40;
+        const MIN_BUTTON_PX = 20;
+
+        const EDGE_HIDE_DELAY_MS = 400;     // Grace period to move from a panel onto its tools
+        const EDGE_TOUCH_SHOW_MS = 3000;    // Touchscreens: how long tools stay after a tap
+        const EDGE_OVERLAP_PX = 4;          // Tools overlap the panel edge so there is no gap to cross
+        const EDGE_HYSTERESIS_PX = 8;       // Don't flip sides until another edge is clearly nearer
+        const MENU_GAP_PX = 8;
+        const COPIED_FEEDBACK_MS = 1200;
+        const SAME_ORIGIN_POLL_MS = 1000;   // How often to re-read a same-origin slide's address
+        const RESIZE_SAVE_DELAY_MS = 250;
+
+        /**
+         * Fallback for anything a config file leaves out. Deliberately holds no
+         * slides: those live in config.json, so this file contains no URLs.
+         * @type {DashboardConfig}
+         */
         const DEFAULT_CONFIG = {
+            version: CONFIG_VERSION,
             intervalSeconds: 10,
             uiOpacity: 0.8,
             showQueue: true,
             panelPos: { bottom: '24px', right: '24px', left: 'auto', top: 'auto' },
             queuePos: { top: '24px', right: '24px', left: 'auto', bottom: 'auto' },
+            urlPos: null,
             settingsPos: null,
-            items: [
-                { url: "https://play.grafana.org/d/efa86fd1d0c121a26444b636a3f509a8/kubernetes-compute-resources-cluster?from=now-30m&to=now&timezone=UTC&var-datasource=grafanacloud-prom&var-cluster=appenv-grafana-play-cluster&var-lokids=%24__all&refresh=30s", label: "Kubernetes Cluster", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
-                { url: "https://play.grafana.org/d/T512JVH7z/loki-nginx-service-mesh-json-version?from=now-6h&to=now&timezone=browser&var-datasource=ac4000ca-1959-45f5-aa45-2bd0898f7026&var-label_name=filename&var-label_value=%2Fvar%2Flog%2Fnginx%2Fjson_access.log&var-job=%24__all&var-instance=%24__all", label: "NGINX Logs", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
-                { url: "https://www.openstreetmap.org/export/embed.html?bbox=-106.2559%2C28.5750%2C-105.8159%2C28.7918&layer=mapnik&marker=28.6369%2C-106.0767", label: "Street Map", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
-                { url: "https://en.wikipedia.org/wiki/Portal:Current_events", label: "Current Events", style: { top: '20px', left: '20px', width: '250px', height: '60px' } }
-            ]
+            items: [],
         };
 
-        /** @type {DashboardConfig} The currently active/edited configuration. */
-        let liveConfig = null;
-        /** @type {DashboardConfig} The configuration used as a restore point (initial or imported). */
-        let baselineConfig = null;
-        /** @type {DashboardConfig} Temporary config used while editing in the settings modal. */
-        let tempConfig = null;
+        /** Static icon markup (contains no user data, so innerHTML is safe here). */
+        const ROW_GRIP_ICON = '<svg fill="currentColor" aria-hidden="true"><use href="#icon-grip-v"></use></svg>';
+        const TRASH_ICON = '<svg width="20" height="20" fill="currentColor" aria-hidden="true"><use href="#icon-trash"></use></svg>';
 
-        let iframes = [];
-        let labels = [];
+        // ----------------------------------------------------------------------
+        // STATE
+        // ----------------------------------------------------------------------
+
+        /** @type {DashboardConfig} What is on screen right now. */
+        let liveConfig = null;
+        /** @type {DashboardConfig} Restore point: the config file, or the last imported config. */
+        let baselineConfig = null;
+
+        /** @type {Slide[]} In rotation order. */
+        let slides = [];
+        /** Finds the slide a queue row or label element belongs to. */
+        const slideByElement = new WeakMap();
         let currentIndex = 0;
         let intervalId = null;
         let isPlaying = true;
         let isMuted = false;
 
+        /** The config file this page uses, and where its state is saved. */
+        const configFile = new URLSearchParams(window.location.search).get('config') || DEFAULT_CONFIG_FILE;
+        const storageKey = STORAGE_PREFIX + configFile;
+        /** Raw text of the config file the saved state is based on (to notice when it changes). */
+        let configSource = null;
+        /** Why the config file couldn't be used, or null. 'file' = blocked because the page was opened from disk. */
+        let loadProblem = null;
+
         // ----------------------------------------------------------------------
-        // INITIALIZATION
+        // SMALL HELPERS
         // ----------------------------------------------------------------------
 
-        /**
-         * Bootstrap the application.
-         * Loads state, applies CSS, builds DOM elements, and starts timers.
-         */
-        function init() {
-            loadConfig();
-            applyGlobalStyles();
-            buildDashboard();
-            startSlideshow();
-            
-            // Initialize drag handlers for UI panels
-            setupDraggablePanel('panel-drag-handle', 'control-panel', 'panelPos');
-            setupDraggablePanel('queue-drag-handle', 'queue-overlay', 'queuePos');
-            setupDraggablePanel('settings-drag-handle', 'settings-panel', 'settingsPos');
+        const $ = (id) => document.getElementById(id);
+        const clone = (value) => JSON.parse(JSON.stringify(value));
+        const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+        const currentSlide = () => slides[currentIndex] || null;
+
+        /** Works for HTML and SVG elements alike (SVG has no `.hidden` property). */
+        function setHidden(el, hidden) {
+            el.toggleAttribute('hidden', hidden);
         }
 
-        /**
-         * Loads configuration from localStorage.
-         * Ensures both a Live and Baseline config exist.
-         */
-        function loadConfig() {
-            const savedLive = localStorage.getItem(STORAGE_KEY_LIVE);
-            const savedBaseline = localStorage.getItem(STORAGE_KEY_BASELINE);
+        /** Number from a number or numeric string; NaN for anything else. */
+        function toNumber(value) {
+            if (typeof value === 'number') return value;
+            if (typeof value === 'string' && value.trim() !== '') return Number(value);
+            return NaN;
+        }
 
-            if (savedLive && savedBaseline) {
-                try {
-                    liveConfig = JSON.parse(savedLive);
-                    baselineConfig = JSON.parse(savedBaseline);
-                } catch (e) {
-                    console.error("Failed to parse config. Restoring defaults.", e);
-                    resetToDefaults();
-                }
-            } else {
-                resetToDefaults();
+        // localStorage can throw (private windows, disabled storage, full quota).
+        function readStorage(key) {
+            try { return localStorage.getItem(key); } catch { return null; }
+        }
+        function writeStorage(key, value) {
+            try {
+                localStorage.setItem(key, value);
+            } catch (err) {
+                console.warn('SiteRover: could not save settings to localStorage.', err);
+            }
+        }
+        function parseJson(text) {
+            if (typeof text !== 'string') return null;
+            try { return JSON.parse(text); } catch { return null; }
+        }
+
+        /** Routes all moves of this pointer to `el`. Throws if the pointer was already released; ignore that. */
+        function capturePointer(el, pointerId) {
+            try { el.setPointerCapture(pointerId); } catch { /* drag still works without capture */ }
+        }
+
+        /** Opens a URL in a new tab with no link back to SiteRover. */
+        function openInNewTab(url) {
+            window.open(url, '_blank', 'noopener,noreferrer');
+        }
+
+        /** Copies text; falls back to the old execCommand route where the Clipboard API is unavailable. */
+        async function copyText(text) {
+            try {
+                await navigator.clipboard.writeText(text);
+                return true;
+            } catch {
+                const area = document.createElement('textarea');
+                area.value = text;
+                area.setAttribute('readonly', '');
+                area.style.position = 'fixed';
+                area.style.opacity = '0';
+                document.body.appendChild(area);
+                area.select();
+                let ok = false;
+                try { ok = document.execCommand('copy'); } catch { ok = false; }
+                area.remove();
+                return ok;
             }
         }
 
+        // ----------------------------------------------------------------------
+        // CONFIG VALIDATION
+        // Everything that enters liveConfig (localStorage, config files, the
+        // settings form) goes through normalizeConfig, so the rest of the code
+        // can trust its shape.
+        // ----------------------------------------------------------------------
+
         /**
-         * Resets state entirely using the FOSS default constant.
+         * Turns user input into a URL SiteRover is willing to load, or null.
+         * "example.com" becomes "https://example.com"; paths starting with "/", "./"
+         * or "../" stay relative to this page.
+         * @param {unknown} input
+         * @returns {string|null}
          */
-        function resetToDefaults() {
-            liveConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
-            baselineConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+        function toSafeUrl(input) {
+            if (typeof input !== 'string') return null;
+            let candidate = input.trim();
+            if (!candidate) return null;
+
+            const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(candidate);
+            const isRelative = /^(\.{0,2}\/|[?#])/.test(candidate);
+            if (!hasScheme && !isRelative) candidate = `https://${candidate}`;
+
+            try {
+                const url = new URL(candidate, window.location.href);
+                return ALLOWED_PROTOCOLS.includes(url.protocol) ? candidate : null;
+            } catch {
+                return null;
+            }
+        }
+
+        const CSS_LENGTH = /^(auto|-?\d+(\.\d+)?(px|%|vw|vh|vmin|vmax|rem|em))$/;
+        const BARE_NUMBER = /^-?\d+(\.\d+)?$/;
+
+        /**
+         * Keeps only well-formed position/size values.
+         * @returns {ElementStyle|null}
+         */
+        function normalizeStyle(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            const out = {};
+            for (const key of ['top', 'left', 'bottom', 'right', 'width', 'height']) {
+                let value = raw[key];
+                if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
+                if (typeof value !== 'string') continue;
+                value = value.trim();
+                if (BARE_NUMBER.test(value)) value += 'px';
+                if (CSS_LENGTH.test(value)) out[key] = value;
+            }
+            return Object.keys(out).length ? out : null;
+        }
+
+        /**
+         * Labels always get a position and a fixed size: text fitting depends on
+         * the box not growing with its content.
+         * @returns {ElementStyle}
+         */
+        function normalizeLabelStyle(raw) {
+            const style = normalizeStyle(raw) || {};
+            if (!style.top && !style.bottom) style.top = DEFAULT_LABEL_STYLE.top;
+            if (!style.left && !style.right) style.left = DEFAULT_LABEL_STYLE.left;
+            if (!style.width || style.width === 'auto') style.width = DEFAULT_LABEL_STYLE.width;
+            if (!style.height || style.height === 'auto') style.height = DEFAULT_LABEL_STYLE.height;
+            return style;
+        }
+
+        /** @returns {DashboardItem|null} null when the URL is missing or not allowed. */
+        function normalizeItem(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            const url = toSafeUrl(raw.url);
+            if (!url) return null;
+            const item = {
+                url,
+                label: typeof raw.label === 'string' ? raw.label : '',
+                style: normalizeLabelStyle(raw.style),
+            };
+            for (const key of PANEL_KEYS) {
+                const box = normalizeStyle(raw[key]);
+                if (box) item[key] = box;
+            }
+            if (typeof raw.showQueue === 'boolean') item.showQueue = raw.showQueue;
+            return item;
+        }
+
+        /**
+         * Coerces anything into a complete, valid config. Unknown keys are dropped;
+         * missing or invalid values fall back to the defaults.
+         * @param {unknown} raw
+         * @returns {{ config: DashboardConfig, skipped: number }} skipped = items dropped for bad URLs
+         */
+        function normalizeConfig(raw) {
+            const defaults = clone(DEFAULT_CONFIG);
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+                return { config: defaults, skipped: 0 };
+            }
+
+            const interval = toNumber(raw.intervalSeconds);
+            const opacity = toNumber(raw.uiOpacity);
+            const rawItems = Array.isArray(raw.items) ? raw.items : null;
+            const items = rawItems ? rawItems.map(normalizeItem).filter(Boolean) : defaults.items;
+
+            return {
+                config: {
+                    version: CONFIG_VERSION,
+                    intervalSeconds: interval >= MIN_INTERVAL_SECONDS ? interval : defaults.intervalSeconds,
+                    uiOpacity: Number.isFinite(opacity) ? clamp(opacity, MIN_OPACITY, 1) : defaults.uiOpacity,
+                    showQueue: typeof raw.showQueue === 'boolean' ? raw.showQueue : defaults.showQueue,
+                    panelPos: normalizeStyle(raw.panelPos) || defaults.panelPos,
+                    queuePos: normalizeStyle(raw.queuePos) || defaults.queuePos,
+                    urlPos: normalizeStyle(raw.urlPos),
+                    settingsPos: normalizeStyle(raw.settingsPos),
+                    items,
+                },
+                skipped: rawItems ? rawItems.length - items.length : 0,
+            };
+        }
+
+        // ----------------------------------------------------------------------
+        // PERSISTENCE
+        // ----------------------------------------------------------------------
+
+        /**
+         * Reads the config file.
+         * @returns {Promise<{ config?: DashboardConfig, text?: string, error?: string }>}
+         */
+        async function fetchConfigFile(url) {
+            try {
+                const signal = typeof AbortSignal.timeout === 'function'
+                    ? AbortSignal.timeout(CONFIG_FETCH_TIMEOUT_MS)
+                    : undefined;
+                const response = await fetch(url, { cache: 'no-cache', signal });
+                if (!response.ok) return { error: `${url} could not be loaded (HTTP ${response.status}).` };
+                const text = await response.text();
+                const raw = parseJson(text);
+                if (!raw || !Array.isArray(raw.items)) {
+                    return { error: `${url} is not a valid SiteRover config (it needs an "items" list).` };
+                }
+                return { config: normalizeConfig(raw).config, text };
+            } catch (err) {
+                // Opened from disk: Chrome and Firefox block reading other local files.
+                if (window.location.protocol === 'file:') return { error: 'file' };
+                return { error: `${url} could not be loaded (${err.message}).` };
+            }
+        }
+
+        /** Settings saved by the pre-release prototype, if any. */
+        function readLegacyState() {
+            const live = parseJson(readStorage(LEGACY_STORAGE_KEYS.live));
+            const baseline = parseJson(readStorage(LEGACY_STORAGE_KEYS.baseline));
+            return live || baseline ? { live: live ?? baseline, baseline: baseline ?? live } : null;
+        }
+
+        /**
+         * Decides what to show on start:
+         *  - The config file changed since this screen last saw it, or this is
+         *    the first run: the file wins.
+         *  - The file is unchanged: keep this screen's own edits.
+         *  - The file can't be read (e.g. opened from disk): use the saved state.
+         * The baseline (what "Restore" returns to) is the file, or the last import.
+         */
+        async function loadConfig() {
+            const saved = parseJson(readStorage(storageKey));
+            const legacy = !saved && configFile === DEFAULT_CONFIG_FILE ? readLegacyState() : null;
+            const file = await fetchConfigFile(configFile);
+
+            let state = saved || legacy;
+            if (file.config) {
+                const fileChanged = saved ? saved.source !== file.text : !legacy;
+                if (fileChanged) state = { live: file.config, baseline: file.config };
+                configSource = file.text;
+            } else {
+                loadProblem = file.error;
+                configSource = (saved && saved.source) || null;
+                console.warn(`SiteRover: ${file.error === 'file' ? `can't read ${configFile} from disk` : file.error}`);
+            }
+
+            const live = state ? state.live : null;
+            const baseline = state ? state.baseline : null;
+            liveConfig = normalizeConfig(live ?? baseline).config;
+            baselineConfig = normalizeConfig(baseline ?? live).config;
             saveConfig();
         }
 
-        /**
-         * Serializes the current Live and Baseline configs to localStorage.
-         */
         function saveConfig() {
-            localStorage.setItem(STORAGE_KEY_LIVE, JSON.stringify(liveConfig));
-            localStorage.setItem(STORAGE_KEY_BASELINE, JSON.stringify(baselineConfig));
+            writeStorage(storageKey, JSON.stringify({
+                live: liveConfig,
+                baseline: baselineConfig,
+                source: configSource,
+            }));
         }
 
+        // ----------------------------------------------------------------------
+        // FITTING: contents adapt to the size and shape of resized panels
+        // ----------------------------------------------------------------------
+
         /**
-         * Applies positioning and opacity to global UI components based on liveConfig.
+         * Sets the largest font size (px) on `target` for which `fits()` holds,
+         * by binary search (about 8 layout passes). Returns the size used.
          */
-        function applyGlobalStyles() {
-            const controlPanel = document.getElementById('control-panel');
-            controlPanel.style.opacity = liveConfig.uiOpacity;
-            applyPosition(controlPanel, liveConfig.panelPos);
-            
-            const queueOverlay = document.getElementById('queue-overlay');
-            if (liveConfig.showQueue) {
-                queueOverlay.classList.remove('hidden');
-                queueOverlay.style.opacity = liveConfig.uiOpacity;
-            } else {
-                queueOverlay.classList.add('hidden');
+        function fitFontSize(target, fits, min, max) {
+            let low = min;
+            let high = Math.max(min, max);
+            while (high - low > 0.5) {
+                const mid = (low + high) / 2;
+                target.style.fontSize = `${mid}px`;
+                if (fits()) low = mid;
+                else high = mid;
             }
-            applyPosition(queueOverlay, liveConfig.queuePos);
+            const size = Math.floor(low);
+            target.style.fontSize = `${size}px`;
+            return size;
+        }
 
-            const settingsPanel = document.getElementById('settings-panel');
-            if (liveConfig.settingsPos && liveConfig.settingsPos.top !== 'auto') {
-                settingsPanel.style.position = 'absolute';
-                settingsPanel.style.margin = '0';
-                applyPosition(settingsPanel, liveConfig.settingsPos);
+        const overflows = (el) => el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight;
+        /**
+         * A panel with both a width and a height set (by resizing or the config)
+         * has a fixed box, so its contents are fitted to it. Otherwise the panel
+         * sizes itself around its contents at their default size.
+         */
+        const isSized = (el) => Boolean(el.style.width && el.style.height);
+
+        /** Label text: as large as the box allows. */
+        function fitLabelText(content) {
+            if (!content || !content.isConnected) return;
+            fitFontSize(content, () => !overflows(content), MIN_TEXT_PX, content.clientHeight);
+        }
+
+        /**
+         * Queue text: at its natural size the panel just wraps its rows; once
+         * resized, everything scales so all rows fit (it scrolls if even the
+         * smallest size is too big).
+         */
+        function fitQueueText() {
+            const panel = $('queue-overlay');
+            if (panel.hidden) return;
+            if (!isSized(panel)) {
+                panel.style.fontSize = '';
+                return;
+            }
+            const list = $('queue-list');
+            const texts = [...list.querySelectorAll('.queue-text')];
+            fitFontSize(panel, () => list.scrollHeight <= list.clientHeight
+                && !overflows(panel) && texts.every((t) => t.scrollWidth <= t.clientWidth), MIN_TEXT_PX, MAX_QUEUE_FONT_PX);
+        }
+
+        /**
+         * Address text: one line with an ellipsis at the panel's natural size;
+         * once resized, as large as fits, wrapping onto more lines as needed.
+         */
+        function fitUrlText() {
+            if (urlPanel.hidden) return;
+            urlText.style.setProperty('--url-lines', 'none');
+            if (!isSized(urlPanel)) {
+                urlPanel.style.fontSize = '';
+                urlText.style.setProperty('--url-lines', '1');
+                return;
+            }
+            fitFontSize(urlPanel, () => !overflows(urlPanel), MIN_TEXT_PX, MAX_URL_FONT_PX);
+            if (overflows(urlPanel)) {
+                // Too long even at the smallest size: show what fits, with an ellipsis.
+                const style = window.getComputedStyle(urlPanel);
+                const inner = urlPanel.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+                const lineHeight = parseFloat(window.getComputedStyle(urlText).lineHeight) || MIN_TEXT_PX;
+                urlText.style.setProperty('--url-lines', String(Math.max(1, Math.floor(inner / lineHeight))));
             }
         }
 
         /**
-         * Helper to apply an ElementStyle object to an HTML element.
-         * @param {HTMLElement} el 
-         * @param {ElementStyle} pos 
+         * Control panel: at its natural size the buttons sit in one row. Once
+         * resized, try every column count and keep the one that gives the
+         * biggest square buttons for the panel's shape (a tall, narrow panel
+         * becomes a vertical strip, a big one gets big buttons).
+         */
+        function fitControls() {
+            const panel = $('control-panel');
+            if (!isSized(panel)) {
+                panel.classList.remove('is-fitted');
+                panel.style.removeProperty('--btn');
+                panel.style.removeProperty('--cols');
+                return;
+            }
+            const count = panel.querySelectorAll('.control-btn').length;
+            const style = window.getComputedStyle(panel);
+            const width = panel.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+            const height = panel.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+            let best = { cols: count, size: 0 };
+            for (let cols = 1; cols <= count; cols++) {
+                const size = Math.min(width / cols, height / Math.ceil(count / cols));
+                if (size > best.size) best = { cols, size };
+            }
+            panel.classList.add('is-fitted');
+            panel.style.setProperty('--cols', String(best.cols));
+            panel.style.setProperty('--btn', `${Math.max(MIN_BUTTON_PX, Math.floor(best.size))}px`);
+        }
+
+        // ----------------------------------------------------------------------
+        // LAYOUT
+        // ----------------------------------------------------------------------
+
+        /**
+         * @param {HTMLElement} el
+         * @param {ElementStyle|null} pos
          */
         function applyPosition(el, pos) {
             if (!pos) return;
@@ -536,599 +1596,1261 @@
             el.style.left = pos.left || 'auto';
             el.style.bottom = pos.bottom || 'auto';
             el.style.right = pos.right || 'auto';
-            if (pos.width) el.style.width = pos.width;
-            if (pos.height) el.style.height = pos.height;
+            el.style.width = pos.width || '';
+            el.style.height = pos.height || '';
         }
 
+        /** Applies a stored box to a panel, or clears it so the stylesheet's default applies. */
+        function applyPanelBox(el, box) {
+            if (box) {
+                applyPosition(el, box);
+                el.style.transform = 'none';
+            } else {
+                for (const prop of GEOMETRY_PROPS) el.style[prop] = '';
+            }
+        }
+
+        /** Where a panel should be on the current slide: its own box, else the global one. */
+        function effectivePanelBox(key) {
+            const slide = currentSlide();
+            return (slide && slide.item[key]) || liveConfig[key] || null;
+        }
+
+        /** Moves (and sizes) the control, queue and address panels for the current slide. */
+        function applyPanelPositions() {
+            for (const key of PANEL_KEYS) applyPanelBox($(PANEL_ELEMENT_IDS[key]), effectivePanelBox(key));
+            fitControls();
+            fitQueueText();
+            fitUrlText();
+        }
+
+        /**
+         * Rewrites an element's position as top/left pixels without moving it on
+         * screen. Needed before dragging, and before resizing panels anchored to
+         * the right or bottom (otherwise the resize corner drifts from the pointer).
+         */
+        function pinToPixels(el) {
+            const rect = el.getBoundingClientRect();
+            const parent = el.offsetParent ? el.offsetParent.getBoundingClientRect() : { top: 0, left: 0 };
+            Object.assign(el.style, {
+                position: 'absolute',
+                margin: '0',
+                transform: 'none',
+                top: `${rect.top - parent.top}px`,
+                left: `${rect.left - parent.left}px`,
+                right: 'auto',
+                bottom: 'auto',
+            });
+        }
+
+        /**
+         * Saves where a panel is, and its size if the user resized it. The control,
+         * queue and address panels are saved for the current slide; the settings
+         * dialog has one position for everything.
+         * @param {'panelPos'|'queuePos'|'urlPos'|'settingsPos'} key
+         * @param {HTMLElement} el
+         * @param {Slide|null} [slide]
+         */
+        function savePanelBox(key, el, slide = currentSlide()) {
+            pinToPixels(el);
+            const box = { top: el.style.top, left: el.style.left, bottom: 'auto', right: 'auto' };
+            if (el.style.width) box.width = el.style.width;
+            if (el.style.height) box.height = el.style.height;
+            if (key !== 'settingsPos' && slide) slide.item[key] = box;
+            else liveConfig[key] = box;
+            saveConfig();
+        }
+
+        /** Panels and labels use this opacity at rest (CSS makes them opaque while in use). */
+        function setUiOpacity(value) {
+            document.documentElement.style.setProperty('--ui-opacity', String(value));
+        }
+
+        /** Whether the queue panel shows on a slide: the slide's own choice, else the global one. */
+        function queueVisible(slide = currentSlide()) {
+            return slide && typeof slide.item.showQueue === 'boolean' ? slide.item.showQueue : liveConfig.showQueue;
+        }
+
+        function applyQueueVisibility() {
+            setHidden($('queue-overlay'), !queueVisible());
+            fitQueueText();
+        }
+
+        /** Applies opacity, visibility, position and size of the panels from liveConfig. */
+        function applyGlobalStyles() {
+            setUiOpacity(liveConfig.uiOpacity);
+            applyPanelPositions();
+            applyQueueVisibility();
+
+            const settingsPanel = $('settings-panel');
+            const pos = liveConfig.settingsPos;
+            if (pos && pos.top && pos.top !== 'auto') {
+                settingsPanel.style.position = 'absolute';
+                settingsPanel.style.margin = '0';
+                applyPosition(settingsPanel, pos);
+            } else {
+                // Back to the default: centered by the flex container, natural size.
+                for (const prop of ['position', 'margin', 'transform', 'top', 'left', 'bottom', 'right', 'width', 'height']) {
+                    settingsPanel.style[prop] = '';
+                }
+            }
+        }
+
+        /**
+         * Watches the panels: re-fits their contents to any new size, and saves
+         * sizes the user set with the resize corner (control, queue and address
+         * panels per slide; the settings dialog globally).
+         */
+        const OBSERVED_PANELS = {
+            'control-panel': { key: 'panelPos', fit: fitControls },
+            'queue-overlay': { key: 'queuePos', fit: fitQueueText },
+            'url-panel': { key: 'urlPos', fit: fitUrlText },
+            'settings-panel': { key: 'settingsPos', fit: null },
+        };
+        let panelResizeTimer = null;
+        const panelObserver = new ResizeObserver((entries) => {
+            for (const { target } of entries) {
+                const { key, fit } = OBSERVED_PANELS[target.id];
+                // Only fixed-size panels are refitted here: fitting can't change
+                // their size, so it can't trigger another round of resizes.
+                if (fit && isSized(target)) fit();
+                const box = (key === 'settingsPos' ? liveConfig.settingsPos : effectivePanelBox(key)) || {};
+                if (target.style.width !== (box.width || '') || target.style.height !== (box.height || '')) {
+                    const slide = currentSlide();
+                    clearTimeout(panelResizeTimer);
+                    panelResizeTimer = setTimeout(() => savePanelBox(key, target, slide), RESIZE_SAVE_DELAY_MS);
+                }
+            }
+        });
+
         // ----------------------------------------------------------------------
-        // DOM CONSTRUCTION (IFRAMES, LABELS, QUEUE)
+        // CURRENT ADDRESS PANEL
+        // Browsers don't let a page read the address of a cross-origin iframe.
+        // So: same-origin slides show their real, live address; for other sites
+        // we can only tell THAT the page navigated (an iframe load we didn't
+        // start), and then show the starting address in italics.
+        // ----------------------------------------------------------------------
+
+        const urlPanel = $('url-panel');
+        const urlText = $('url-text');
+        let copyResetTimer = null;
+
+        /** The best address we know for a slide. */
+        function slideUrl(slide) {
+            return slide.currentUrl || slide.item.url;
+        }
+
+        function updateUrlPanel() {
+            clearTimeout(copyResetTimer);
+            urlPanel.classList.remove('is-copied', 'is-copy-failed');
+            const slide = currentSlide();
+            setHidden(urlPanel, !slide);
+            if (!slide) return;
+
+            const stale = slide.navigated && !slide.currentUrl;
+            urlText.textContent = slideUrl(slide);
+            urlPanel.classList.toggle('is-stale', stale);
+            urlPanel.title = stale
+                ? 'You navigated inside this page. Browsers hide the new address from SiteRover, so this is the address the slide started on. Click to copy.'
+                : 'Click to copy this address';
+            fitUrlText();
+        }
+
+        /** Runs on every load of a slide's iframe, ours or the page's own. */
+        function onFrameLoad(slide) {
+            if (isMuted) postMuteCommand(slide.frame);
+            let href = null;
+            try { href = slide.frame.contentWindow.location.href; } catch { /* cross-origin: unreadable */ }
+            if (href === 'about:blank') return; // Our own placeholder while reloading
+
+            if (slide.pendingLoads > 0) slide.pendingLoads -= 1;
+            else slide.navigated = true;
+            slide.currentUrl = href;
+            if (slide === currentSlide()) updateUrlPanel();
+        }
+
+        /** Same-origin pages can change address without a full load (links to #anchors, history API). */
+        function pollSameOriginUrl() {
+            const slide = currentSlide();
+            if (!slide || !slide.currentUrl) return;
+            let href = null;
+            try { href = slide.frame.contentWindow.location.href; } catch { return; }
+            if (href && href !== 'about:blank' && href !== slide.currentUrl) {
+                slide.currentUrl = href;
+                updateUrlPanel();
+            }
+        }
+
+        async function copyCurrentUrl() {
+            const slide = currentSlide();
+            if (!slide) return;
+            const ok = await copyText(slideUrl(slide));
+            urlText.textContent = ok ? 'Copied to clipboard' : 'Could not copy (the browser blocked clipboard access)';
+            urlPanel.classList.add(ok ? 'is-copied' : 'is-copy-failed');
+            fitUrlText();
+            clearTimeout(copyResetTimer);
+            copyResetTimer = setTimeout(updateUrlPanel, COPIED_FEEDBACK_MS);
+        }
+
+        // A click that ends a resize (size changed) or a drag across the text is not a copy.
+        let urlPress = null;
+        urlPanel.addEventListener('pointerdown', (e) => {
+            urlPress = { x: e.clientX, y: e.clientY, w: urlPanel.offsetWidth, h: urlPanel.offsetHeight };
+        });
+        urlPanel.addEventListener('click', (e) => {
+            const press = urlPress;
+            urlPress = null;
+            if (press && (urlPanel.offsetWidth !== press.w || urlPanel.offsetHeight !== press.h
+                || Math.hypot(e.clientX - press.x, e.clientY - press.y) > 4)) return;
+            copyCurrentUrl();
+        });
+        urlPanel.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                copyCurrentUrl();
+            }
+        });
+
+        // ----------------------------------------------------------------------
+        // EDGE TOOLS
+        // One floating toolbar shared by all panels. It appears next to the
+        // hovered panel, on the edge nearest the pointer, and slightly overlaps
+        // that edge so the pointer can move onto it without "leaving".
+        // ----------------------------------------------------------------------
+
+        const edgeTools = $('edge-tools');
+        const edgeGrip = $('edge-grip');
+        const edgeOpen = $('edge-open');
+        /** @type {EdgePanel|null} */
+        let edgeTarget = null;
+        let edgeSide = null;
+        let edgeHideTimer = null;
+        let edgeDragging = false;
+
+        /** 'top' | 'right' | 'bottom' | 'left': the panel edge closest to the pointer. */
+        function nearestEdge(rect, x, y) {
+            const dist = { top: y - rect.top, bottom: rect.bottom - y, left: x - rect.left, right: rect.right - x };
+            let best = Object.keys(dist).reduce((a, b) => (dist[a] <= dist[b] ? a : b));
+            if (edgeSide && edgeSide !== best && dist[edgeSide] - dist[best] < EDGE_HYSTERESIS_PX) best = edgeSide;
+            return best;
+        }
+
+        function positionEdgeTools() {
+            if (!edgeTarget) return;
+            const panel = edgeTarget.el.getBoundingClientRect();
+            const tools = edgeTools.getBoundingClientRect();
+            let x = panel.left + (panel.width - tools.width) / 2;
+            let y = panel.top + (panel.height - tools.height) / 2;
+            if (edgeSide === 'top') y = panel.top - tools.height + EDGE_OVERLAP_PX;
+            if (edgeSide === 'bottom') y = panel.bottom - EDGE_OVERLAP_PX;
+            if (edgeSide === 'left') x = panel.left - tools.width + EDGE_OVERLAP_PX;
+            if (edgeSide === 'right') x = panel.right - EDGE_OVERLAP_PX;
+            edgeTools.style.left = `${clamp(x, 2, window.innerWidth - tools.width - 2)}px`;
+            edgeTools.style.top = `${clamp(y, 2, window.innerHeight - tools.height - 2)}px`;
+        }
+
+        /** @param {EdgePanel} panel */
+        function showEdgeTools(panel, x, y) {
+            clearTimeout(edgeHideTimer);
+            if (edgeTarget !== panel) {
+                if (edgeTarget) edgeTarget.el.classList.remove('is-hovered');
+                edgeTarget = panel;
+                edgeSide = null;
+                if (panel.resizable) pinToPixels(panel.el);
+            }
+            panel.el.classList.add('is-hovered');
+            edgeSide = nearestEdge(panel.el.getBoundingClientRect(), x, y);
+            edgeTools.dataset.edge = edgeSide;
+            setHidden(edgeOpen, !panel.canOpen);
+            edgeTools.classList.add('is-visible');
+            positionEdgeTools();
+        }
+
+        function hideEdgeTools() {
+            if (edgeDragging) return;
+            clearTimeout(edgeHideTimer);
+            edgeTools.classList.remove('is-visible');
+            if (edgeTarget) edgeTarget.el.classList.remove('is-hovered');
+            edgeTarget = null;
+            edgeSide = null;
+        }
+
+        function scheduleHideEdgeTools(delay = EDGE_HIDE_DELAY_MS) {
+            if (edgeDragging) return;
+            clearTimeout(edgeHideTimer);
+            edgeHideTimer = setTimeout(hideEdgeTools, delay);
+        }
+
+        /** @param {EdgePanel} panel */
+        function registerEdgePanel(panel) {
+            panel.el.addEventListener('pointermove', (e) => {
+                if (!edgeDragging && e.pointerType !== 'touch') showEdgeTools(panel, e.clientX, e.clientY);
+            });
+            panel.el.addEventListener('pointerleave', (e) => {
+                if (e.pointerType !== 'touch') scheduleHideEdgeTools();
+            });
+            // Touchscreens can't hover: a tap shows the tools for a few seconds.
+            panel.el.addEventListener('pointerdown', (e) => {
+                if (e.pointerType !== 'touch' || edgeDragging) return;
+                showEdgeTools(panel, e.clientX, e.clientY);
+                scheduleHideEdgeTools(EDGE_TOUCH_SHOW_MS);
+            });
+        }
+
+        edgeTools.addEventListener('pointerenter', () => clearTimeout(edgeHideTimer));
+        edgeTools.addEventListener('pointerleave', (e) => {
+            if (e.pointerType !== 'touch') scheduleHideEdgeTools();
+        });
+
+        // Dragging by the grip moves whichever panel the tools are attached to.
+        // Pointer capture keeps the drag going over iframes.
+        edgeGrip.addEventListener('pointerdown', (e) => {
+            const panel = edgeTarget;
+            if (!panel || e.button !== 0) return;
+            e.preventDefault();
+            const el = panel.el;
+            edgeDragging = true;
+            el.classList.add('is-dragging');
+            closePopovers();
+            pinToPixels(el);
+            const startX = e.clientX;
+            const startY = e.clientY;
+            const startTop = el.offsetTop;
+            const startLeft = el.offsetLeft;
+            capturePointer(edgeGrip, e.pointerId);
+
+            const move = (ev) => {
+                el.style.top = `${startTop + ev.clientY - startY}px`;
+                el.style.left = `${startLeft + ev.clientX - startX}px`;
+                positionEdgeTools();
+            };
+            const end = () => {
+                edgeGrip.removeEventListener('pointermove', move);
+                edgeGrip.removeEventListener('pointerup', end);
+                edgeGrip.removeEventListener('pointercancel', end);
+                // Commit the final position before transitions come back on;
+                // otherwise the last bit of the drag would animate.
+                void el.offsetWidth;
+                el.classList.remove('is-dragging');
+                edgeDragging = false;
+                panel.onDragEnd();
+                if (!edgeTools.matches(':hover')) scheduleHideEdgeTools();
+            };
+
+            edgeGrip.addEventListener('pointermove', move);
+            edgeGrip.addEventListener('pointerup', end);
+            edgeGrip.addEventListener('pointercancel', end);
+        });
+
+        edgeOpen.addEventListener('click', () => {
+            const slide = currentSlide();
+            if (slide) openInNewTab(slideUrl(slide));
+        });
+
+        // ----------------------------------------------------------------------
+        // BUILDING THE STAGE (IFRAMES, LABELS, QUEUE)
         // ----------------------------------------------------------------------
 
         /**
-         * Wipes the main stage containers and rebuilds all Iframes, Labels, and Queue items.
+         * Watches label boxes. On any size change the text is refitted, and sizes
+         * the user set with the native resize corner are saved.
          */
+        let labelResizeTimer = null;
+        const labelObserver = new ResizeObserver((entries) => {
+            for (const { target } of entries) {
+                const slide = slideByElement.get(target);
+                if (!slide) continue;
+                fitLabelText(target.querySelector('.label-content'));
+                const { width = '', height = '' } = slide.item.style;
+                if (target.style.width !== width || target.style.height !== height) {
+                    clearTimeout(labelResizeTimer);
+                    labelResizeTimer = setTimeout(() => persistLabelBox(slide), RESIZE_SAVE_DELAY_MS);
+                }
+            }
+        });
+
+        /** Rebuilds every iframe, label and queue row from liveConfig. */
         function buildDashboard() {
-            const container = document.getElementById('iframe-container');
-            const labelContainer = document.getElementById('label-container');
-            const queueList = document.getElementById('queue-list');
-            
-            container.innerHTML = '';
-            labelContainer.innerHTML = '';
-            queueList.innerHTML = '';
-            
-            iframes = [];
-            labels = [];
+            const frameContainer = $('iframe-container');
+            const labelContainer = $('label-container');
+            const queueList = $('queue-list');
+
+            hideEdgeTools();
+            labelObserver.disconnect();
+            clearTimeout(labelResizeTimer);
+            frameContainer.replaceChildren();
+            labelContainer.replaceChildren();
+            queueList.replaceChildren();
             currentIndex = 0;
 
-            if (liveConfig.items.length === 0) return;
+            slides = liveConfig.items.map((item) => {
+                const queueItem = document.createElement('div');
+                queueItem.className = 'queue-item';
+                queueItem.title = 'Click to show this slide';
+                const queueHandle = document.createElement('span');
+                queueHandle.className = 'queue-handle';
+                queueHandle.title = 'Drag to reorder';
+                queueHandle.innerHTML = ROW_GRIP_ICON;
+                const queueText = document.createElement('span');
+                queueText.className = 'queue-text';
+                queueItem.append(queueHandle, queueText);
+                queueList.appendChild(queueItem);
 
-            liveConfig.items.forEach((item, index) => {
-                // 1. Build Queue Entry
-                const qItem = document.createElement('div');
-                qItem.className = `queue-item ${index === 0 ? 'active' : ''}`;
-                qItem.id = `queue-item-${index}`;
-                qItem.innerText = `${index + 1}. ${item.label || 'Untitled'}`;
-                queueList.appendChild(qItem);
+                const frame = document.createElement('iframe');
+                frame.src = item.url;
+                frameContainer.appendChild(frame);
 
-                // 2. Build Iframe (All load simultaneously)
-                const iframe = document.createElement('iframe');
-                iframe.src = item.url;
-                if(index === 0) iframe.classList.add('active');
-                container.appendChild(iframe);
-                iframes.push(iframe);
-
-                // 3. Build Floating Label
-                if (item.label !== undefined) {
-                    const labelWrap = document.createElement('div');
-                    labelWrap.className = 'dashboard-label';
-                    if(index === 0) labelWrap.classList.add('active');
-                    
-                    labelWrap.style.opacity = index === 0 ? liveConfig.uiOpacity : 0; 
-                    applyPosition(labelWrap, item.style);
-
-                    // Add HTML inner structure including the Drag Handle and editable Content
-                    labelWrap.innerHTML = `
-                        <div class="label-header drag-handle">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/></svg>
-                        </div>
-                        <div class="label-content" contenteditable="true" spellcheck="false">${item.label}</div>
-                    `;
-                    
-                    setupInlineLabelEditing(labelWrap, index);
-                    setupDraggableLabel(labelWrap, index);
-                    
-                    labelContainer.appendChild(labelWrap);
-                    labels.push(labelWrap);
-                } else {
-                    labels.push(null);
-                }
+                /** @type {Slide} */
+                const slide = {
+                    item, frame, label: null, queueItem, queueText,
+                    pendingLoads: 1, navigated: false, currentUrl: null,
+                };
+                slideByElement.set(queueItem, slide);
+                frame.addEventListener('load', () => onFrameLoad(slide));
+                if (item.label) slide.label = createLabel(slide, labelContainer);
+                return slide;
             });
-            updateMuteState();
+
+            renumberSlides();
+            setHidden($('empty-state'), slides.length > 0);
+            $('empty-message').textContent = emptyStateMessage();
+            $('btn-open-tab').disabled = slides.length === 0;
+            updateView();
+            updateMuteButton();
+        }
+
+        /** Refreshes the "1. Label" queue text and iframe titles after edits or reordering. */
+        function renumberSlides() {
+            slides.forEach((slide, i) => {
+                slide.queueText.textContent = `${i + 1}. ${slide.item.label || 'Untitled'}`;
+                slide.frame.title = slide.item.label || `Slide ${i + 1}`;
+            });
+            fitQueueText();
+        }
+
+        function emptyStateMessage() {
+            if (loadProblem === 'file') {
+                return `This page was opened from disk, and browsers don't let it read ${configFile} on its own. `
+                    + 'Import it once and this screen will remember it, or serve this folder from a web server.';
+            }
+            if (loadProblem) return `${loadProblem} Import a config file, or add sites in Settings.`;
+            return 'Add a site in Settings, or import a config file.';
         }
 
         /**
-         * Sets up contenteditable events to sync label text with the liveConfig and queue.
-         * @param {HTMLElement} labelWrap 
-         * @param {number} index 
+         * Creates the floating label for one slide. User text is only ever
+         * assigned through textContent, never parsed as HTML.
+         * @param {Slide} slide
+         * @param {HTMLElement} container
          */
-        function setupInlineLabelEditing(labelWrap, index) {
-            const content = labelWrap.querySelector('.label-content');
-            let wasPlaying = false;
-            
-            // Prevent dragging from firing while trying to highlight text
-            content.addEventListener('mousedown', e => e.stopPropagation());
-            
+        function createLabel(slide, container) {
+            const wrap = document.createElement('div');
+            wrap.className = 'dashboard-label panel floating resizable';
+            applyPosition(wrap, slide.item.style);
+
+            const content = document.createElement('div');
+            content.className = 'label-content';
+            content.contentEditable = 'true';
+            content.spellcheck = false;
+            content.title = 'Click to edit';
+            content.textContent = slide.item.label;
+
+            wrap.append(content);
+            container.appendChild(wrap);
+            slideByElement.set(wrap, slide);
+
+            setupInlineLabelEditing(content, slide);
+            registerEdgePanel({ el: wrap, resizable: true, onDragEnd: () => persistLabelBox(slide) });
+            labelObserver.observe(wrap);
+            fitLabelText(content);
+            return wrap;
+        }
+
+        /**
+         * Lets users click a label to rename it in place (Enter saves, Escape cancels).
+         * @param {HTMLElement} content
+         * @param {Slide} slide
+         */
+        function setupInlineLabelEditing(content, slide) {
+            let resumeAfterEdit = false;
+
             content.addEventListener('focus', () => {
-                wasPlaying = isPlaying;
-                if (intervalId) clearInterval(intervalId); // Pause rotation automatically
+                resumeAfterEdit = isPlaying;
+                stopTimer(); // Don't rotate away mid-edit
             });
-            
-            content.addEventListener('blur', (e) => {
-                const newText = e.target.innerText.trim();
-                liveConfig.items[index].label = newText;
-                
-                // Synchronously update the queue item
-                const qItem = document.getElementById(`queue-item-${index}`);
-                if(qItem) qItem.innerText = `${index + 1}. ${newText}`;
-                
+
+            content.addEventListener('input', () => fitLabelText(content));
+
+            content.addEventListener('blur', () => {
+                const text = content.innerText.trim();
+                slide.item.label = text;
+                content.textContent = text; // Drops any formatting pasted in
+                fitLabelText(content);
+                renumberSlides();
                 saveConfig();
-                if (wasPlaying) startSlideshow();
+                if (resumeAfterEdit) startSlideshow();
             });
-            
+
             content.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter') {
                     e.preventDefault();
-                    content.blur(); // Blur triggers the save logic above
+                    content.blur();
+                } else if (e.key === 'Escape') {
+                    content.textContent = slide.item.label;
+                    content.blur();
                 }
             });
         }
 
+        /**
+         * Copies a label's on-screen position and size into its item and saves.
+         * @param {Slide} slide
+         */
+        function persistLabelBox(slide) {
+            const el = slide.label;
+            if (!el) return;
+            slide.item.style = {
+                top: el.style.top || `${el.offsetTop}px`,
+                left: el.style.left || `${el.offsetLeft}px`,
+                width: el.style.width || `${el.offsetWidth}px`,
+                height: el.style.height || `${el.offsetHeight}px`,
+            };
+            applyPosition(el, slide.item.style);
+            saveConfig();
+        }
+
         // ----------------------------------------------------------------------
-        // SLIDESHOW LOGIC
+        // SLIDESHOW
         // ----------------------------------------------------------------------
 
-        /**
-         * Updates CSS classes to reveal the active iframe and hide others.
-         */
+        /** Shows the slide at currentIndex, hides the others, and lays out the panels for it. */
         function updateView() {
-            iframes.forEach((ifr, i) => {
-                const isActive = (i === currentIndex);
-                const qItem = document.getElementById(`queue-item-${i}`);
-                
-                if (isActive) {
-                    ifr.classList.add('active');
-                    if(qItem) qItem.classList.add('active');
-                    if(labels[i]) {
-                        labels[i].classList.add('active');
-                        labels[i].style.opacity = liveConfig.uiOpacity;
-                    }
-                } else {
-                    ifr.classList.remove('active');
-                    if(qItem) qItem.classList.remove('active');
-                    if(labels[i]) {
-                        labels[i].classList.remove('active');
-                        labels[i].style.opacity = 0;
-                    }
-                }
+            hideEdgeTools();
+            clearTimeout(panelResizeTimer);
+            slides.forEach((slide, i) => {
+                const active = i === currentIndex;
+                slide.frame.classList.toggle('active', active);
+                slide.queueItem.classList.toggle('active', active);
+                if (slide.label) slide.label.classList.toggle('active', active);
             });
+            applyPanelPositions();
+            applyQueueVisibility();
+            updateUrlPanel();
+        }
+
+        /** Jumps to a slide chosen by the user (pauses, like Previous/Next). */
+        function showSlide(index) {
+            if (index < 0 || index >= slides.length) return;
+            pauseSlideshow();
+            currentIndex = index;
+            updateView();
         }
 
         function nextSlide() {
-            if (iframes.length <= 1) return;
-            currentIndex = (currentIndex + 1) % iframes.length;
+            // Never switch slides mid-drag or while a menu is open.
+            if (slides.length <= 1 || edgeDragging || anyPopoverOpen()) return;
+            currentIndex = (currentIndex + 1) % slides.length;
             updateView();
         }
 
         function prevSlide() {
-            if (iframes.length <= 1) return;
-            currentIndex = (currentIndex - 1 + iframes.length) % iframes.length;
+            if (slides.length <= 1) return;
+            currentIndex = (currentIndex - 1 + slides.length) % slides.length;
             updateView();
         }
 
+        function stopTimer() {
+            clearInterval(intervalId);
+            intervalId = null;
+        }
+
         function startSlideshow() {
-            if (intervalId) clearInterval(intervalId);
-            if (iframes.length > 1) {
+            stopTimer();
+            if (slides.length > 1) {
                 intervalId = setInterval(nextSlide, liveConfig.intervalSeconds * 1000);
             }
             isPlaying = true;
-            document.getElementById('icon-play').classList.add('hidden');
-            document.getElementById('icon-pause').classList.remove('hidden');
+            updatePlayButton();
         }
 
         function pauseSlideshow() {
-            clearInterval(intervalId);
+            stopTimer();
             isPlaying = false;
-            document.getElementById('icon-pause').classList.add('hidden');
-            document.getElementById('icon-play').classList.remove('hidden');
+            updatePlayButton();
+        }
+
+        function updatePlayButton() {
+            setHidden($('icon-play'), isPlaying);
+            setHidden($('icon-pause'), !isPlaying);
+            const button = $('btn-playpause');
+            const text = isPlaying ? 'Pause rotation' : 'Resume rotation';
+            button.title = text;
+            button.setAttribute('aria-label', text);
         }
 
         // ----------------------------------------------------------------------
-        // DRAG & DROP LOGIC (MATHEMATICS & PERSISTENCE)
+        // QUEUE: CLICK A ROW TO SHOW IT, DRAG ITS GRIP TO REORDER
+        // Only the queue rows move in the DOM. Iframes stay where they are,
+        // because moving an iframe element makes the browser reload it.
         // ----------------------------------------------------------------------
 
         /**
-         * Generic Draggable implementation for UI panels (Main Control, Queue, Settings).
-         * Uses offset calculations and translates bottom/right constraints into absolute top/left.
-         * @param {string} handleId 
-         * @param {string} elementId 
-         * @param {string} configKey - Property inside liveConfig to save coords.
+         * Drag-to-reorder for a vertical list (the queue and the settings table).
+         * Press a row's handle and move: the row moves in the DOM as the pointer
+         * passes its neighbours, and `onDrop` reads the new order from the DOM.
+         * Near the top or bottom edge of `scroller` the list scrolls, so long
+         * lists can be reordered too.
          */
-        function setupDraggablePanel(handleId, elementId, configKey) {
-            const handle = document.getElementById(handleId);
-            const element = document.getElementById(elementId);
-            if (!handle || !element) return;
-            
-            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-            
-            handle.onmousedown = (e) => {
+        function makeSortable(list, handleSelector, onDrop, scroller = list) {
+            list.addEventListener('pointerdown', (e) => {
+                const handle = e.target.closest(handleSelector);
+                if (!handle || e.button !== 0) return;
+                const row = [...list.children].find((el) => el.contains(handle));
+                if (!row) return;
                 e.preventDefault();
-                pos3 = e.clientX;
-                pos4 = e.clientY;
-                
-                // Convert flexible flex positioning (like centered modals) to strict absolute coordinates
-                if (window.getComputedStyle(element).position !== 'absolute') {
-                    const rect = element.getBoundingClientRect();
-                    element.style.position = 'absolute';
-                    element.style.margin = '0';
-                    element.style.transform = 'none';
-                    element.style.top = rect.top + 'px';
-                    element.style.left = rect.left + 'px';
-                    element.style.right = 'auto';
-                    element.style.bottom = 'auto';
-                }
+                row.classList.add('is-dragging');
+                // Capture on the list (not the row): the row itself moves in the DOM.
+                capturePointer(list, e.pointerId);
 
-                document.onmouseup = () => {
-                    document.onmouseup = null;
-                    document.onmousemove = null;
-                    if (configKey) {
-                        liveConfig[configKey] = {
-                            top: element.style.top || (element.offsetTop + "px"),
-                            left: element.style.left || (element.offsetLeft + "px"),
-                            bottom: 'auto', 
-                            right: 'auto'
-                        };
-                        saveConfig();
-                    }
+                const move = (ev) => {
+                    const edge = scroller.getBoundingClientRect();
+                    if (ev.clientY < edge.top + 24) scroller.scrollTop -= 12;
+                    else if (ev.clientY > edge.bottom - 24) scroller.scrollTop += 12;
+                    // Put the row before the first sibling whose middle is below the pointer.
+                    const before = [...list.children].find((el) => {
+                        if (el === row) return false;
+                        const box = el.getBoundingClientRect();
+                        return ev.clientY < box.top + box.height / 2;
+                    }) || null;
+                    if (before !== row.nextElementSibling) list.insertBefore(row, before);
                 };
 
-                document.onmousemove = (e) => {
-                    e.preventDefault();
-                    pos1 = pos3 - e.clientX;
-                    pos2 = pos4 - e.clientY;
-                    pos3 = e.clientX;
-                    pos4 = e.clientY;
-                    element.style.top = (element.offsetTop - pos2) + "px";
-                    element.style.left = (element.offsetLeft - pos1) + "px";
-                    element.style.bottom = 'auto';
-                    element.style.right = 'auto';
+                const end = () => {
+                    list.removeEventListener('pointermove', move);
+                    list.removeEventListener('pointerup', end);
+                    list.removeEventListener('pointercancel', end);
+                    row.classList.remove('is-dragging');
+                    onDrop();
                 };
-            };
-        }
 
-        /**
-         * Specialized draggable for Labels, ensuring it also captures native CSS resize events.
-         * @param {HTMLElement} element 
-         * @param {number} index - Index of the item in liveConfig.items
-         */
-        function setupDraggableLabel(element, index) {
-            const header = element.querySelector('.label-header');
-            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-            
-            header.onmousedown = (e) => {
-                e.preventDefault();
-                pos3 = e.clientX;
-                pos4 = e.clientY;
-                
-                document.onmouseup = () => {
-                    document.onmouseup = null;
-                    document.onmousemove = null;
-                    updateLabelPersistence(index, element);
-                };
-                
-                document.onmousemove = (e) => {
-                    e.preventDefault();
-                    pos1 = pos3 - e.clientX;
-                    pos2 = pos4 - e.clientY;
-                    pos3 = e.clientX;
-                    pos4 = e.clientY;
-                    element.style.top = (element.offsetTop - pos2) + "px";
-                    element.style.left = (element.offsetLeft - pos1) + "px";
-                };
-            };
-
-            // Detect native CSS resizes (which fire a mouseup on the element body, not the header)
-            element.addEventListener('mouseup', (e) => {
-                if(e.target !== header) {
-                    updateLabelPersistence(index, element);
-                }
+                list.addEventListener('pointermove', move);
+                list.addEventListener('pointerup', end);
+                list.addEventListener('pointercancel', end);
             });
         }
 
-        /**
-         * Syncs visual DOM coordinates back into the liveConfig model and saves.
-         * @param {number} index 
-         * @param {HTMLElement} element 
-         */
-        function updateLabelPersistence(index, element) {
-            liveConfig.items[index].style = {
-                top: element.style.top || (element.offsetTop + 'px'),
-                left: element.style.left || (element.offsetLeft + 'px'),
-                width: element.style.width || (element.offsetWidth + 'px'),
-                height: element.style.height || (element.offsetHeight + 'px')
-            };
+        function setupQueueReordering() {
+            const list = $('queue-list');
+            list.addEventListener('click', (e) => {
+                if (e.target.closest('.queue-handle')) return;
+                const entry = e.target.closest('.queue-item');
+                if (entry) showSlide(slides.indexOf(slideByElement.get(entry)));
+            });
+            makeSortable(list, '.queue-handle', applyQueueOrder);
+        }
+
+        /** Makes the queue's on-screen order the new rotation order and saves it. */
+        function applyQueueOrder() {
+            const order = [...$('queue-list').children].map((el) => slideByElement.get(el));
+            if (order.every((slide, i) => slide === slides[i])) return; // Dropped where it started
+            const active = currentSlide();
+            slides = order;
+            liveConfig.items = slides.map((slide) => slide.item);
+            currentIndex = Math.max(0, slides.indexOf(active));
+            renumberSlides();
             saveConfig();
+            updateView();
+        }
+
+        // Queue visibility, for the current slide or all of them (menu on the queue button).
+        function syncQueueMenu() {
+            const anyShown = slides.length ? slides.some((s) => queueVisible(s)) : liveConfig.showQueue;
+            $('btn-queue-current').textContent = `${queueVisible() ? 'Hide' : 'Show'} Queue on This Slide`;
+            $('btn-queue-all').textContent = `${anyShown ? 'Hide' : 'Show'} Queue on All Slides`;
+        }
+
+        function toggleQueueCurrent() {
+            const slide = currentSlide();
+            if (!slide) {
+                liveConfig.showQueue = !liveConfig.showQueue;
+            } else {
+                const show = !queueVisible(slide);
+                // Only store an override when it differs from the global choice.
+                if (show === liveConfig.showQueue) delete slide.item.showQueue;
+                else slide.item.showQueue = show;
+            }
+            saveConfig();
+            applyQueueVisibility();
+        }
+
+        function toggleQueueAll() {
+            const anyShown = slides.length ? slides.some((s) => queueVisible(s)) : liveConfig.showQueue;
+            liveConfig.showQueue = !anyShown;
+            for (const slide of slides) delete slide.item.showQueue;
+            saveConfig();
+            applyQueueVisibility();
         }
 
         // ----------------------------------------------------------------------
-        // CACHE BUSTING & RELOAD LOGIC
+        // LAYOUT COMMANDS (menu)
         // ----------------------------------------------------------------------
 
         /**
-         * Helper utility to inject a cache-busting timestamp query parameter securely.
-         * Ensures fragments (#) remain at the very end of the URL string.
-         * @param {string} urlStr 
-         * @returns {string} 
+         * The baseline entry for a slide. Slides can be reordered, so they are
+         * matched by URL (the 2nd slide with a URL matches the 2nd baseline
+         * entry with that URL).
+         * @param {Slide} slide
+         * @returns {DashboardItem|null}
+         */
+        function findBaselineItem(slide) {
+            const { url } = slide.item;
+            const rank = slides.filter((s) => s.item.url === url).indexOf(slide);
+            return baselineConfig.items.filter((b) => b.url === url)[rank] || null;
+        }
+
+        /** @param {Slide} slide */
+        function restoreSlideLayout(slide) {
+            const baseline = findBaselineItem(slide);
+            if (!baseline) return;
+            slide.item.style = clone(baseline.style);
+            for (const key of [...PANEL_KEYS, 'showQueue']) {
+                if (baseline[key] !== undefined) slide.item[key] = clone(baseline[key]);
+                else delete slide.item[key];
+            }
+            if (slide.label) applyPosition(slide.label, slide.item.style);
+        }
+
+        function restoreCurrentLayout() {
+            const slide = currentSlide();
+            if (!slide) return;
+            restoreSlideLayout(slide);
+            saveConfig();
+            applyPanelPositions();
+            applyQueueVisibility();
+        }
+
+        function restoreAllLayouts() {
+            for (const key of PANEL_KEYS) {
+                liveConfig[key] = baselineConfig[key] ? clone(baselineConfig[key]) : null;
+            }
+            liveConfig.showQueue = baselineConfig.showQueue;
+            liveConfig.settingsPos = baselineConfig.settingsPos ? clone(baselineConfig.settingsPos) : null;
+            slides.forEach(restoreSlideLayout);
+            saveConfig();
+            applyGlobalStyles();
+        }
+
+        /** Copies the current slide's panel layout, queue visibility and label box to every slide. */
+        function applyLayoutToAll() {
+            const source = currentSlide();
+            if (!source) return;
+            for (const key of PANEL_KEYS) {
+                const box = source.item[key] || liveConfig[key];
+                liveConfig[key] = box ? clone(box) : null;
+            }
+            liveConfig.showQueue = queueVisible(source);
+            for (const slide of slides) {
+                for (const key of [...PANEL_KEYS, 'showQueue']) delete slide.item[key];
+                slide.item.style = clone(source.item.style);
+                if (slide.label) applyPosition(slide.label, slide.item.style);
+            }
+            saveConfig();
+            applyPanelPositions();
+            applyQueueVisibility();
+        }
+
+        // ----------------------------------------------------------------------
+        // RELOADING
+        // ----------------------------------------------------------------------
+
+        /**
+         * Adds a timestamp query parameter so the browser can't serve a cached
+         * copy. Keeps any #fragment at the end, where it belongs.
          */
         function getCacheBustedUrl(urlStr) {
             try {
-                const url = new URL(urlStr);
+                const url = new URL(urlStr, window.location.href);
                 url.searchParams.set('cb', Date.now());
-                return url.toString();
-            } catch (e) {
+                return url.href;
+            } catch {
                 const [base, hash] = urlStr.split('#');
                 const separator = base.includes('?') ? '&' : '?';
-                return `${base}${separator}cb=${Date.now()}${hash ? '#' + hash : ''}`;
+                return `${base}${separator}cb=${Date.now()}${hash ? `#${hash}` : ''}`;
             }
         }
 
         /**
-         * Helper to force an iframe to completely destroy its inner context and rebuild.
-         * @param {HTMLIFrameElement} ifr 
-         * @param {string} src 
+         * Tears an iframe down to about:blank and loads its configured URL again,
+         * which also forgets any navigation done inside it.
+         * @param {Slide|null} slide
+         * @param {{ hard?: boolean }} [options] - hard = bypass the cache
          */
-        function forceFrameRebuild(ifr, src) {
-            ifr.src = ''; 
-            setTimeout(() => { ifr.src = src; }, 50);
+        function reloadSlide(slide, { hard = false } = {}) {
+            if (!slide) return;
+            const src = hard ? getCacheBustedUrl(slide.item.url) : slide.item.url;
+            slide.navigated = false;
+            slide.currentUrl = null;
+            if (slide === currentSlide()) updateUrlPanel();
+            slide.frame.src = 'about:blank';
+            setTimeout(() => {
+                slide.pendingLoads = 1;
+                slide.frame.src = src;
+            }, 50);
         }
 
         // ----------------------------------------------------------------------
-        // EVENT LISTENERS (UI CONTROLS)
+        // MUTE
+        // Browsers don't let a page mute a cross-origin iframe. The best we can
+        // do is ask: YouTube embeds loaded with ?enablejsapi=1 understand this
+        // message, and every other site ignores it. (PeerTube embeds can start
+        // muted with ?muted=1 in their URL.)
         // ----------------------------------------------------------------------
 
-        // Play/Pause/Prev/Next
-        document.getElementById('btn-playpause').addEventListener('click', () => isPlaying ? pauseSlideshow() : startSlideshow());
-        document.getElementById('btn-next').addEventListener('click', () => { pauseSlideshow(); nextSlide(); });
-        document.getElementById('btn-prev').addEventListener('click', () => { pauseSlideshow(); prevSlide(); });
+        function postMuteCommand(frame) {
+            const message = JSON.stringify({ event: 'command', func: isMuted ? 'mute' : 'unMute', args: [] });
+            try {
+                if (frame.contentWindow) frame.contentWindow.postMessage(message, '*');
+            } catch {
+                // The frame is gone or not ready yet; it will be asked again on load.
+            }
+        }
 
-        // Toggle Queue visibility dynamically
-        document.getElementById('btn-toggle-queue').addEventListener('click', () => {
-            liveConfig.showQueue = !liveConfig.showQueue;
-            saveConfig();
-            applyGlobalStyles();
+        function updateMuteButton() {
+            setHidden($('icon-muted'), !isMuted);
+            setHidden($('icon-unmuted'), isMuted);
+            const button = $('btn-mute');
+            button.setAttribute('aria-pressed', String(isMuted));
+            button.setAttribute('aria-label', isMuted ? 'Unmute' : 'Mute');
+        }
+
+        // ----------------------------------------------------------------------
+        // CONTROL PANEL EVENTS AND MENUS
+        // ----------------------------------------------------------------------
+
+        $('btn-playpause').addEventListener('click', () => (isPlaying ? pauseSlideshow() : startSlideshow()));
+        $('btn-next').addEventListener('click', () => { pauseSlideshow(); nextSlide(); });
+        $('btn-prev').addEventListener('click', () => { pauseSlideshow(); prevSlide(); });
+
+        $('btn-open-tab').addEventListener('click', () => {
+            const slide = currentSlide();
+            if (slide) openInNewTab(slideUrl(slide));
         });
 
-        // Mute Handling (Primarily conceptual as cross-origin restricts script interaction)
-        function updateMuteState() {
-            const iconMuted = document.getElementById('icon-muted');
-            const iconUnmuted = document.getElementById('icon-unmuted');
-            if(isMuted) {
-                iconUnmuted.classList.add('hidden');
-                iconMuted.classList.remove('hidden');
-            } else {
-                iconMuted.classList.add('hidden');
-                iconUnmuted.classList.remove('hidden');
-            }
-            iframes.forEach(ifr => {
-                try { ifr.contentWindow.postMessage('{"event":"command","func":"mute"}', '*'); } catch(e){}
-            });
-        }
-        document.getElementById('btn-mute').addEventListener('click', () => {
+        $('btn-mute').addEventListener('click', () => {
             isMuted = !isMuted;
-            updateMuteState();
+            updateMuteButton();
+            slides.forEach((slide) => postMuteCommand(slide.frame));
         });
 
-        // Dropdown Toggle
-        const reloadDropdown = document.getElementById('reload-dropdown');
-        document.getElementById('btn-reload-toggle').addEventListener('click', (e) => {
-            e.stopPropagation();
-            reloadDropdown.classList.toggle('hidden');
-        });
-        document.addEventListener('click', (e) => {
-            if (!reloadDropdown.contains(e.target) && e.target.id !== 'btn-reload-toggle') {
-                reloadDropdown.classList.add('hidden');
-            }
-        });
+        // At most one menu open at a time. Menus sit outside the control panel
+        // and are placed above their button (or below, if there is no room).
+        const popovers = [
+            { button: $('btn-opacity'), panel: $('opacity-popover'), onOpen: syncQuickOpacity },
+            { button: $('btn-reload-toggle'), panel: $('reload-dropdown') },
+            { button: $('btn-toggle-queue'), panel: $('queue-menu'), onOpen: syncQueueMenu },
+        ];
+        const anyPopoverOpen = () => popovers.some((p) => !p.panel.hidden);
 
-        // Dropdown Action: Reload Current (Soft)
-        document.getElementById('btn-reload-current').addEventListener('click', () => {
-            if(iframes[currentIndex] && liveConfig.items[currentIndex]) {
-                forceFrameRebuild(iframes[currentIndex], liveConfig.items[currentIndex].url);
-            }
-            reloadDropdown.classList.add('hidden');
-        });
-        
-        // Dropdown Action: Reset Current (Hard)
-        document.getElementById('btn-reset-current').addEventListener('click', () => {
-            if(iframes[currentIndex] && liveConfig.items[currentIndex]) {
-                forceFrameRebuild(iframes[currentIndex], getCacheBustedUrl(liveConfig.items[currentIndex].url));
-            }
-            reloadDropdown.classList.add('hidden');
-        });
-
-        // Dropdown Action: Reload All (Soft)
-        document.getElementById('btn-reload-all').addEventListener('click', () => {
-            iframes.forEach((ifr, idx) => {
-                if(liveConfig.items[idx]) forceFrameRebuild(ifr, liveConfig.items[idx].url);
-            });
-            reloadDropdown.classList.add('hidden');
-        });
-        
-        // Dropdown Action: Reset All (Hard)
-        document.getElementById('btn-reset-all').addEventListener('click', () => {
-            iframes.forEach((ifr, idx) => {
-                if(liveConfig.items[idx]) forceFrameRebuild(ifr, getCacheBustedUrl(liveConfig.items[idx].url));
-            });
-            reloadDropdown.classList.add('hidden');
-        });
-
-        // Dropdown Action: Restore Current Layout (Pull from baselineConfig)
-        document.getElementById('btn-restore-current').addEventListener('click', () => {
-            if (baselineConfig.items[currentIndex]) {
-                liveConfig.items[currentIndex].style = JSON.parse(JSON.stringify(baselineConfig.items[currentIndex].style));
-                saveConfig();
-                
-                // Instantly apply without full rebuild
-                if (labels[currentIndex]) {
-                    applyPosition(labels[currentIndex], liveConfig.items[currentIndex].style);
-                }
-            }
-            reloadDropdown.classList.add('hidden');
-        });
-
-        // Dropdown Action: Restore All Layouts (Pull completely from baselineConfig)
-        document.getElementById('btn-restore-all').addEventListener('click', () => {
-            // Restore Panel coordinates
-            liveConfig.panelPos = JSON.parse(JSON.stringify(baselineConfig.panelPos));
-            liveConfig.queuePos = JSON.parse(JSON.stringify(baselineConfig.queuePos));
-            liveConfig.settingsPos = baselineConfig.settingsPos ? JSON.parse(JSON.stringify(baselineConfig.settingsPos)) : null;
-            
-            // Restore all Label coordinates safely
-            liveConfig.items.forEach((item, idx) => {
-                if (baselineConfig.items[idx]) {
-                    item.style = JSON.parse(JSON.stringify(baselineConfig.items[idx].style));
-                }
-            });
-            
-            saveConfig();
-            applyGlobalStyles();
-            
-            // Apply to all live label DOM elements
-            labels.forEach((lbl, idx) => {
-                if(lbl && liveConfig.items[idx]) applyPosition(lbl, liveConfig.items[idx].style);
-            });
-            
-            reloadDropdown.classList.add('hidden');
-        });
-
-
-        // ----------------------------------------------------------------------
-        // SETTINGS MODAL & CONFIG MANAGEMENT
-        // ----------------------------------------------------------------------
-        
-        const modal = document.getElementById('settings-modal');
-        const settingsListEl = document.getElementById('item-list');
-        const inputOpacity = document.getElementById('input-opacity');
-        const opacityVal = document.getElementById('opacity-val');
-
-        /**
-         * Renders the dynamic list of URLs and Labels in the settings modal.
-         * Binds real-time onChange events to the tempConfig object.
-         */
-        function renderSettingsList() {
-            settingsListEl.innerHTML = '';
-            tempConfig.items.forEach((item, idx) => {
-                const row = document.createElement('div');
-                row.className = "flex flex-col md:flex-row gap-2 bg-gray-900 border border-gray-700 p-3 rounded";
-                row.innerHTML = `
-                    <div class="flex-1 flex flex-col gap-1">
-                        <input type="text" class="edit-url bg-gray-800 text-sm border border-gray-600 rounded px-2 py-1 text-white" value="${item.url}" data-idx="${idx}" placeholder="URL">
-                        <input type="text" class="edit-label bg-gray-800 text-sm border border-gray-600 rounded px-2 py-1 text-white" value="${item.label}" data-idx="${idx}" placeholder="Label Text">
-                    </div>
-                    <div class="flex items-center">
-                        <button class="text-red-500 hover:bg-red-900 hover:bg-opacity-30 p-2 rounded remove-item" data-idx="${idx}" title="Remove Item">
-                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
-                        </button>
-                    </div>
-                `;
-                settingsListEl.appendChild(row);
-            });
-
-            // Bind tempConfig updates
-            document.querySelectorAll('.edit-url').forEach(el => el.addEventListener('change', e => {
-                tempConfig.items[e.target.dataset.idx].url = e.target.value;
-            }));
-            document.querySelectorAll('.edit-label').forEach(el => el.addEventListener('change', e => {
-                tempConfig.items[e.target.dataset.idx].label = e.target.value;
-            }));
-            document.querySelectorAll('.remove-item').forEach(el => el.addEventListener('click', e => {
-                tempConfig.items.splice(parseInt(e.currentTarget.dataset.idx), 1);
-                renderSettingsList();
-            }));
+        function positionPopover({ button, panel }) {
+            const anchor = button.getBoundingClientRect();
+            const menu = panel.getBoundingClientRect();
+            let top = anchor.top - menu.height - MENU_GAP_PX;
+            if (top < MENU_GAP_PX) top = anchor.bottom + MENU_GAP_PX;
+            const left = anchor.left + (anchor.width - menu.width) / 2;
+            panel.style.top = `${clamp(top, MENU_GAP_PX, window.innerHeight - menu.height - MENU_GAP_PX)}px`;
+            panel.style.left = `${clamp(left, MENU_GAP_PX, window.innerWidth - menu.width - MENU_GAP_PX)}px`;
         }
 
-        // Open Settings Modal
-        document.getElementById('btn-settings').addEventListener('click', () => {
-            pauseSlideshow();
-            tempConfig = JSON.parse(JSON.stringify(liveConfig)); // Deep copy to prevent mutating live state
-            
-            document.getElementById('input-interval').value = tempConfig.intervalSeconds;
-            inputOpacity.value = tempConfig.uiOpacity;
-            opacityVal.innerText = tempConfig.uiOpacity;
-            
-            renderSettingsList();
-            modal.classList.remove('hidden');
-        });
-
-        // Close/Cancel Settings Modal
-        document.getElementById('btn-cancel').addEventListener('click', () => {
-            modal.classList.add('hidden');
-            // Revert any visual opacity tweaks that occurred while sliding
-            applyGlobalStyles();
-            if(isPlaying) startSlideshow();
-        });
-
-        // Add Item Logic in Modal
-        document.getElementById('btn-add-item').addEventListener('click', () => {
-            const urlInput = document.getElementById('new-url');
-            const labelInput = document.getElementById('new-label');
-            if(urlInput.value.trim()) {
-                tempConfig.items.push({
-                    url: urlInput.value.trim(),
-                    label: labelInput.value.trim(),
-                    style: { top: '20px', left: '20px', width: '200px', height: '60px' }
-                });
-                urlInput.value = '';
-                labelInput.value = '';
-                renderSettingsList();
+        function setPopover(target, open) {
+            let anyOpen = false;
+            for (const popover of popovers) {
+                const isOpen = popover === target && open;
+                setHidden(popover.panel, !isOpen);
+                popover.button.setAttribute('aria-expanded', String(isOpen));
+                if (isOpen) {
+                    if (popover.onOpen) popover.onOpen();
+                    positionPopover(popover);
+                    anyOpen = true;
+                }
             }
+            $('control-panel').classList.toggle('has-open-menu', anyOpen);
+        }
+        function closePopovers() {
+            setPopover(null, false);
+        }
+
+        for (const popover of popovers) {
+            popover.button.addEventListener('click', (e) => {
+                e.stopPropagation();
+                setPopover(popover, popover.panel.hidden);
+            });
+        }
+        document.addEventListener('click', (e) => {
+            const inside = popovers.some((p) => p.panel.contains(e.target) || p.button.contains(e.target));
+            if (!inside) closePopovers();
         });
 
-        // Live preview of UI Transparency
-        inputOpacity.addEventListener('input', (e) => {
-            opacityVal.innerText = e.target.value;
-            const tempOpacity = e.target.value;
-            document.getElementById('control-panel').style.opacity = tempOpacity;
-            const q = document.getElementById('queue-overlay');
-            if(q && !q.classList.contains('hidden')) q.style.opacity = tempOpacity;
-            if(labels[currentIndex]) labels[currentIndex].style.opacity = tempOpacity;
-        });
+        // Transparency slider: changes apply live and are saved when released.
+        const quickOpacity = $('quick-opacity');
+        const quickOpacityValue = $('quick-opacity-val');
 
-        // Save & Apply Settings
-        document.getElementById('btn-save').addEventListener('click', () => {
-            tempConfig.intervalSeconds = parseInt(document.getElementById('input-interval').value) || 10;
-            tempConfig.uiOpacity = parseFloat(inputOpacity.value) || 0.8;
-            
-            // Promote tempConfig to liveConfig
-            liveConfig = JSON.parse(JSON.stringify(tempConfig));
+        function syncQuickOpacity() {
+            quickOpacity.value = liveConfig.uiOpacity;
+            quickOpacityValue.textContent = `${Math.round(liveConfig.uiOpacity * 100)}%`;
+        }
+
+        quickOpacity.addEventListener('input', () => {
+            const value = toNumber(quickOpacity.value);
+            liveConfig.uiOpacity = Number.isFinite(value) ? clamp(value, MIN_OPACITY, 1) : DEFAULT_CONFIG.uiOpacity;
+            setUiOpacity(liveConfig.uiOpacity);
+            quickOpacityValue.textContent = `${Math.round(liveConfig.uiOpacity * 100)}%`;
+        });
+        quickOpacity.addEventListener('change', saveConfig);
+
+        const menuActions = {
+            'btn-reload-current': () => reloadSlide(currentSlide()),
+            'btn-reset-current': () => reloadSlide(currentSlide(), { hard: true }),
+            'btn-reload-all': () => slides.forEach((slide) => reloadSlide(slide)),
+            'btn-reset-all': () => slides.forEach((slide) => reloadSlide(slide, { hard: true })),
+            'btn-layout-to-all': applyLayoutToAll,
+            'btn-restore-current': restoreCurrentLayout,
+            'btn-restore-all': restoreAllLayouts,
+            'btn-queue-current': toggleQueueCurrent,
+            'btn-queue-all': toggleQueueAll,
+        };
+        for (const [id, action] of Object.entries(menuActions)) {
+            $(id).addEventListener('click', () => {
+                action();
+                closePopovers();
+            });
+        }
+
+        // ----------------------------------------------------------------------
+        // SETTINGS DIALOG
+        // Edits happen on a copy (tempConfig) and only reach liveConfig on Save.
+        // Messages go to the status line in the footer, never to alert().
+        // ----------------------------------------------------------------------
+
+        const modal = $('settings-modal');
+        const itemList = $('item-list');
+        const inputInterval = $('input-interval');
+        const inputOpacity = $('input-opacity');
+        const opacityValue = $('opacity-val');
+        const importInput = $('input-import');
+        const settingsStatus = $('settings-status');
+
+        /** @type {DashboardConfig|null} */
+        let tempConfig = null;
+        /** @type {DashboardConfig|null} Imported config that becomes the baseline on Save. */
+        let pendingBaseline = null;
+        /** @type {DashboardItem|null} Row to highlight: the slide that was on screen (pencil). */
+        let highlightedItem = null;
+        /** Finds the item a settings row edits. */
+        const itemByRow = new WeakMap();
+        let resumeAfterSettings = false;
+
+        const percent = (value) => `${Math.round(Number(value) * 100)}%`;
+
+        function setStatus(message, isError = false) {
+            settingsStatus.textContent = message;
+            settingsStatus.classList.toggle('is-error', isError);
+        }
+
+        function openSettings() {
+            resumeAfterSettings = isPlaying;
+            pauseSlideshow();
+            closePopovers();
+            hideEdgeTools();
+            tempConfig = clone(liveConfig);
+            pendingBaseline = null;
+            highlightedItem = null;
+            setStatus('');
+            syncSettingsInputs();
+            renderSettingsList();
+            setHidden(modal, false);
+            inputInterval.focus();
+        }
+
+        /** The queue panel's pencil: Settings, with the slide on screen highlighted and focused. */
+        function editCurrentSlide() {
+            openSettings();
+            highlightedItem = tempConfig.items[currentIndex] || null;
+            if (!highlightedItem) return;
+            renderSettingsList();
+            const row = itemList.children[currentIndex];
+            row.scrollIntoView({ block: 'center' });
+            row.querySelector('.cell-url').focus();
+        }
+
+        function closeSettings() {
+            setHidden(modal, true);
+            hideEdgeTools();
+            tempConfig = null;
+            pendingBaseline = null;
+            $('btn-settings').focus();
+        }
+
+        function discardSettings() {
+            closeSettings();
+            applyGlobalStyles(); // Undo the live opacity preview
+            updateView();
+            if (resumeAfterSettings) startSlideshow();
+        }
+
+        function syncSettingsInputs() {
+            inputInterval.value = tempConfig.intervalSeconds;
+            inputOpacity.value = tempConfig.uiOpacity;
+            opacityValue.textContent = percent(tempConfig.uiOpacity);
+        }
+
+        function readSettingsInputs() {
+            const interval = toNumber(inputInterval.value);
+            const opacity = toNumber(inputOpacity.value);
+            tempConfig.intervalSeconds = interval >= MIN_INTERVAL_SECONDS ? interval : DEFAULT_CONFIG.intervalSeconds;
+            tempConfig.uiOpacity = Number.isFinite(opacity) ? clamp(opacity, MIN_OPACITY, 1) : DEFAULT_CONFIG.uiOpacity;
+        }
+
+        /** Renders one editable row per slide in tempConfig. */
+        function renderSettingsList() {
+            const count = tempConfig.items.length;
+            $('slide-count').textContent = String(count);
+            if (!count) {
+                const empty = document.createElement('div');
+                empty.className = 'slide-empty';
+                empty.textContent = 'No slides yet. Add one, or import a config file.';
+                itemList.replaceChildren(empty);
+                return;
+            }
+            itemList.replaceChildren(...tempConfig.items.map(createSettingsRow));
+        }
+
+        /**
+         * One row of the slides table: handle, number, label, address, remove.
+         * User text only ever goes into input values, never into HTML.
+         * @param {DashboardItem} item
+         * @param {number} index
+         */
+        function createSettingsRow(item, index) {
+            const n = index + 1;
+            const row = document.createElement('div');
+            row.className = 'slide-row';
+            row.setAttribute('role', 'listitem');
+            row.classList.toggle('is-current', item === highlightedItem);
+            itemByRow.set(row, item);
+
+            const handle = document.createElement('button');
+            handle.type = 'button';
+            handle.className = 'row-handle';
+            handle.title = 'Drag to reorder';
+            handle.setAttribute('aria-label', `Move slide ${n}. Use the up and down arrow keys.`);
+            handle.innerHTML = ROW_GRIP_ICON;
+            handle.addEventListener('keydown', (e) => {
+                if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+                e.preventDefault();
+                const to = index + (e.key === 'ArrowUp' ? -1 : 1);
+                if (to < 0 || to >= tempConfig.items.length) return;
+                moveSettingsRow(index, to);
+                itemList.children[to].querySelector('.row-handle').focus();
+                setStatus(`Moved to position ${to + 1} of ${tempConfig.items.length}.`);
+            });
+
+            const number = document.createElement('span');
+            number.className = 'row-index';
+            number.textContent = String(n);
+
+            const labelInput = document.createElement('input');
+            labelInput.type = 'text';
+            labelInput.className = 'cell-input cell-label';
+            labelInput.value = item.label;
+            labelInput.placeholder = 'Untitled';
+            labelInput.setAttribute('aria-label', `Label of slide ${n}`);
+            labelInput.addEventListener('input', () => { item.label = labelInput.value; });
+
+            const urlInput = document.createElement('input');
+            urlInput.type = 'text';
+            urlInput.className = 'cell-input cell-url';
+            urlInput.value = item.url;
+            urlInput.placeholder = 'https://example.com';
+            urlInput.spellcheck = false;
+            urlInput.autocomplete = 'off';
+            urlInput.inputMode = 'url';
+            urlInput.setAttribute('aria-label', `Address of slide ${n}`);
+            urlInput.addEventListener('input', () => {
+                item.url = urlInput.value;
+                urlInput.classList.toggle('invalid', urlInput.value.trim() !== '' && !toSafeUrl(urlInput.value));
+            });
+
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'row-remove';
+            remove.title = 'Remove slide';
+            remove.setAttribute('aria-label', `Remove slide ${n}`);
+            remove.innerHTML = TRASH_ICON;
+            remove.addEventListener('click', () => {
+                tempConfig.items.splice(index, 1);
+                renderSettingsList();
+                const next = itemList.children[Math.min(index, tempConfig.items.length - 1)];
+                const target = next && next.querySelector('.row-remove');
+                (target || $('btn-add-item')).focus();
+            });
+
+            row.append(handle, number, labelInput, urlInput, remove);
+            return row;
+        }
+
+        /** Moves a slide in the settings list (keyboard reordering). */
+        function moveSettingsRow(from, to) {
+            const [moved] = tempConfig.items.splice(from, 1);
+            tempConfig.items.splice(to, 0, moved);
+            renderSettingsList();
+        }
+
+        /** After a drag in the settings list: the DOM order becomes the slide order. */
+        function applySettingsOrder() {
+            const order = [...itemList.children].map((row) => itemByRow.get(row));
+            if (order.some((item) => !item) || order.every((item, i) => item === tempConfig.items[i])) return;
+            tempConfig.items = order;
+            renderSettingsList();
+        }
+
+        /** Adds an empty row at the end and puts the cursor in its address field. */
+        function addSlideRow() {
+            tempConfig.items.push({ url: '', label: '', style: { ...DEFAULT_LABEL_STYLE } });
+            renderSettingsList();
+            const row = itemList.lastElementChild;
+            row.scrollIntoView({ block: 'nearest' });
+            row.querySelector('.cell-url').focus();
+        }
+
+        function saveSettings() {
+            readSettingsInputs();
+            // Rows left completely empty (e.g. an added row never filled in) are dropped.
+            const before = tempConfig.items.length;
+            tempConfig.items = tempConfig.items.filter((item) => item.url.trim() || item.label.trim());
+            if (tempConfig.items.length !== before) renderSettingsList();
+
+            const badIndex = tempConfig.items.findIndex((item) => !toSafeUrl(item.url));
+            if (badIndex !== -1) {
+                const input = itemList.children[badIndex].querySelector('.cell-url');
+                input.classList.add('invalid');
+                input.focus();
+                setStatus(`Slide ${badIndex + 1} needs a valid address (http://, https:// or file://).`, true);
+                return;
+            }
+
+            liveConfig = normalizeConfig(tempConfig).config;
+            if (pendingBaseline) baselineConfig = pendingBaseline;
             saveConfig();
-            
-            modal.classList.add('hidden');
+
+            closeSettings();
             applyGlobalStyles();
             buildDashboard();
             startSlideshow();
-        });
+        }
 
-        // ----------------------------------------------------------------------
-        // JSON IMPORT / EXPORT LOGIC
-        // ----------------------------------------------------------------------
+        /** Same name as the config file in use, so the export can replace it directly. */
+        function exportFileName() {
+            const name = configFile.split(/[?#]/)[0].split('/').pop();
+            return name && name.endsWith('.json') ? name : DEFAULT_CONFIG_FILE;
+        }
 
-        document.getElementById('btn-export').addEventListener('click', () => {
-            // Ensure temp config values match current inputs before export
-            tempConfig.intervalSeconds = parseInt(document.getElementById('input-interval').value) || 10;
-            tempConfig.uiOpacity = parseFloat(inputOpacity.value) || 0.8;
-            
-            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(tempConfig, null, 2));
-            const a = document.createElement('a');
-            a.href = dataStr;
-            a.download = "tv_dashboard_config.json";
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-        });
+        function exportConfig() {
+            readSettingsInputs();
+            const { config } = normalizeConfig(tempConfig);
+            const blob = new Blob([`${JSON.stringify(config, null, 2)}\n`], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = exportFileName();
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setStatus(`Exported ${link.download}.`);
+        }
 
-        document.getElementById('input-import').addEventListener('change', (e) => {
-            const file = e.target.files[0];
+        async function importConfig() {
+            const file = importInput.files && importInput.files[0];
+            importInput.value = ''; // Allow importing the same file again later
             if (!file) return;
-            const reader = new FileReader();
-            
-            reader.onload = function(evt) {
-                try {
-                    const imported = JSON.parse(evt.target.result);
-                    if (imported.items && Array.isArray(imported.items)) {
-                        tempConfig = imported;
-                        // Synchronize imported FOSS properties to baseline explicitly
-                        baselineConfig = JSON.parse(JSON.stringify(imported)); 
-                        
-                        // Update UI fields
-                        document.getElementById('input-interval').value = tempConfig.intervalSeconds || 10;
-                        inputOpacity.value = tempConfig.uiOpacity || 0.8;
-                        opacityVal.innerText = inputOpacity.value;
-                        
-                        renderSettingsList();
-                        alert("Settings successfully imported! It is now set as the new Baseline. Click 'Save & Apply' to use them.");
-                    } else {
-                        alert("Invalid JSON format. Cannot parse Dashboard parameters.");
-                    }
-                } catch (err) {
-                    alert("Error reading JSON file.");
-                }
-                e.target.value = ''; // Reset input to allow re-import of same file
-            };
-            reader.readAsText(file);
+
+            const raw = parseJson(await file.text());
+            if (!raw || !Array.isArray(raw.items)) {
+                setStatus(`${file.name} is not a SiteRover config (it has no "items" list).`, true);
+                return;
+            }
+
+            const { config, skipped } = normalizeConfig(raw);
+            tempConfig = config;
+            pendingBaseline = clone(config);
+            highlightedItem = null;
+            syncSettingsInputs();
+            renderSettingsList();
+            const note = skipped ? ` Skipped ${skipped} slide(s) with unsupported addresses.` : '';
+            setStatus(`Loaded ${file.name}. Save to apply it; its layout becomes the one Restore returns to.${note}`);
+        }
+
+        $('btn-settings').addEventListener('click', openSettings);
+        $('btn-queue-edit').addEventListener('click', editCurrentSlide);
+        $('btn-close-settings').addEventListener('click', discardSettings);
+        $('btn-cancel').addEventListener('click', discardSettings);
+        $('btn-save').addEventListener('click', saveSettings);
+        $('btn-export').addEventListener('click', exportConfig);
+        $('btn-import').addEventListener('click', () => importInput.click());
+        importInput.addEventListener('change', importConfig);
+        $('btn-add-item').addEventListener('click', addSlideRow);
+        $('btn-empty-settings').addEventListener('click', openSettings);
+        $('btn-empty-import').addEventListener('click', () => {
+            openSettings();
+            importInput.click();
+        });
+        makeSortable(itemList, '.row-handle', applySettingsOrder, $('settings-panel').querySelector('.dialog-body'));
+
+        // Live preview of panel opacity while the slider moves
+        inputOpacity.addEventListener('input', () => {
+            opacityValue.textContent = percent(inputOpacity.value);
+            setUiOpacity(inputOpacity.value);
         });
 
-        // Run application on load
-        window.onload = init;
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            hideEdgeTools();
+            if (!modal.hidden) discardSettings();
+            else closePopovers();
+        });
+
+        // ----------------------------------------------------------------------
+        // START
+        // ----------------------------------------------------------------------
+
+        async function init() {
+            $('app-version').textContent = VERSION === 'dev' ? '(development build)' : VERSION;
+            await loadConfig();
+            applyGlobalStyles();
+            buildDashboard();
+            startSlideshow();
+
+            const controlPanel = $('control-panel');
+            const queuePanel = $('queue-overlay');
+            const settingsPanel = $('settings-panel');
+            registerEdgePanel({ el: controlPanel, resizable: true, onDragEnd: () => savePanelBox('panelPos', controlPanel) });
+            registerEdgePanel({ el: queuePanel, resizable: true, onDragEnd: () => savePanelBox('queuePos', queuePanel) });
+            registerEdgePanel({ el: urlPanel, resizable: true, canOpen: true, onDragEnd: () => savePanelBox('urlPos', urlPanel) });
+            registerEdgePanel({ el: settingsPanel, resizable: true, onDragEnd: () => savePanelBox('settingsPos', settingsPanel) });
+            // Watch the outer (border) box: padding is in em, so refitting the text
+            // changes the inner box, and that must not count as a resize.
+            for (const id of Object.keys(OBSERVED_PANELS)) panelObserver.observe($(id), { box: 'border-box' });
+            setupQueueReordering();
+
+            window.addEventListener('resize', () => {
+                hideEdgeTools();
+                closePopovers();
+                applyPanelPositions();
+            });
+            setInterval(pollSameOriginUrl, SAME_ORIGIN_POLL_MS);
+        }
+
+        init().catch((err) => console.error('SiteRover failed to start.', err));
     </script>
 </body>
 </html>

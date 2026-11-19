@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "intervalSeconds": 10,
+  "uiOpacity": 0.8,
+  "showQueue": true,
+  "panelPos": { "bottom": "24px", "right": "24px" },
+  "queuePos": { "top": "24px", "right": "24px" },
+  "settingsPos": null,
+  "items": [
+    {
+      "url": "https://www.openstreetmap.org/export/embed.html?bbox=-106.2559%2C28.5750%2C-105.8159%2C28.7918&layer=mapnik&marker=28.6369%2C-106.0767",
+      "label": "Street Map",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Portal:Current_events",
+      "label": "Current Events",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    },
+    {
+      "url": "https://map.blitzortung.org/#4.15/24.41/-88.39",
+      "label": "Live Lightning",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    },
+    {
+      "url": "https://video.blender.org/videos/embed/pkDDcE7HiLU3UTGmRV1nJG?autoplay=1&muted=1&loop=1&title=0&warningTitle=0&peertubeLink=0",
+      "label": "Blender Open Movie",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    },
+    {
+      "url": "https://www.openrailwaymap.org/?style=signals&lat=50.2682767372753&lon=10.030517578125&zoom=6",
+      "label": "Railway Signals",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    },
+    {
+      "url": "https://maps.sensor.community/#6/49.316/21.799",
+      "label": "Air Quality",
+      "style": { "top": "20px", "left": "20px", "width": "250px", "height": "60px" }
+    }
+  ]
+}
