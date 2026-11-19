@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!--
+    ========================================================================
+    PROJECT: TV Dashboard Slideshow
+    DESCRIPTION: A FOSS-ready, zero-dependency (aside from Tailwind) 
+                 single-page application designed to run locally or hosted. 
+                 It cycles through multiple URLs in full-screen iframes, 
+                 intended for digital signage, NOC dashboards, or TV displays.
+                 
+    REQUIREMENT: To embed restricted sites (like zoom.earth), a browser 
+                 extension such as "Ignore X-Frame-Options" must be installed 
+                 on the host machine to bypass CORS/Frame security headers.
+
+    FEATURES:
+    - Smooth crossfading between an infinite number of URL iframes.
+    - Draggable, resizable components with persistence.
+    - JSON Export/Import functionality for deployment across multiple screens.
+    - Dual-state management (Live state vs Baseline/Imported state).
+    ========================================================================
+    -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TV Dashboard Slideshow</title>
+    
+    <!-- Tailwind CSS for rapid styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <style>
+        /* 
+         * GLOBAL STYLES 
+         * Lock the body to exactly viewport dimensions to prevent scrolling on TVs
+         */
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background-color: #000; /* Deep black prevents flash on load */
+            font-family: 'Inter', sans-serif;
+            color: #fff;
+        }
+
+        /* 
+         * IFRAME CONTAINER LAYER (z-index: 1 to 10)
+         * All iframes are loaded simultaneously in the background. 
+         * Opacity transitions handle the crossfading.
+         */
+        #iframe-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+        iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+            opacity: 0;
+            transition: opacity 1s ease-in-out; /* Smooth crossfade duration */
+            pointer-events: none; /* Inactive frames cannot be clicked */
+            z-index: 1;
+        }
+        iframe.active {
+            opacity: 1;
+            z-index: 2;
+            pointer-events: auto; /* Allow interaction with the active frame */
+        }
+
+        /* 
+         * UI COMPONENT LAYER (z-index: 50+)
+         * Reusable drag handle style 
+         */
+        .drag-handle {
+            cursor: grab;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px;
+            color: #9ca3af;
+            transition: color 0.2s;
+        }
+        .drag-handle:hover { color: #fff; }
+        .drag-handle:active { cursor: grabbing; }
+
+        /* Main Control Panel */
+        #control-panel {
+            position: absolute;
+            z-index: 60;
+            display: flex;
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 9999px; /* Pill shape */
+            padding: 4px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            transition: opacity 0.3s;
+        }
+        .control-btn {
+            color: white;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: transparent;
+            border: none;
+        }
+        .control-btn:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+
+        /* Floating Site Labels */
+        #label-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* Allows clicks to fall through to iframe */
+            z-index: 50;
+        }
+        .dashboard-label {
+            position: absolute;
+            pointer-events: auto; /* Catches clicks for dragging/editing */
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            opacity: 0;
+            transition: opacity 0.5s;
+            resize: both; /* Native browser resize handle */
+            overflow: hidden;
+            min-width: 120px;
+            min-height: 40px;
+        }
+        .dashboard-label.active {
+            opacity: 1; /* Made visible when corresponding iframe is active */
+        }
+        .label-header {
+            background: rgba(255,255,255,0.1);
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .label-content {
+            padding: 8px 12px;
+            flex-grow: 1;
+            font-size: 1.25rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            word-wrap: break-word;
+        }
+        /* Visual cue for editable text */
+        .label-content[contenteditable="true"] { cursor: text; }
+        .label-content[contenteditable="true"]:focus {
+            outline: 1px dashed rgba(255,255,255,0.5);
+            background-color: rgba(0,0,0,0.4);
+            border-radius: 4px;
+        }
+
+        /* Queue Overlay Panel */
+        #queue-overlay {
+            position: absolute;
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 55;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 150px;
+            transition: opacity 0.3s;
+            pointer-events: auto;
+        }
+        .queue-item {
+            font-size: 0.875rem;
+            color: #9ca3af;
+            transition: color 0.3s;
+        }
+        .queue-item.active {
+            color: #fff;
+            font-weight: bold;
+        }
+
+        /* Custom Scrollbar for Settings Modal */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+    </style>
+</head>
+<body>
+
+    <!-- LAYER 1: Iframes -->
+    <div id="iframe-container"></div>
+    
+    <!-- LAYER 2: Floating Labels -->
+    <div id="label-container"></div>
+
+    <!-- LAYER 3: Queue Overlay -->
+    <div id="queue-overlay" class="hidden">
+        <div class="drag-handle w-full" id="queue-drag-handle" title="Drag to move panel">
+            <!-- '≡' Hamburger Handle -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+                <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
+            </svg>
+        </div>
+        <h3 class="text-xs font-bold text-gray-400 mb-1 uppercase tracking-wider border-b border-gray-600 pb-1">Upcoming Sequence</h3>
+        <div id="queue-list" class="flex flex-col gap-1"></div>
+    </div>
+
+    <!-- LAYER 4: Main Control Panel -->
+    <div id="control-panel">
+        <div class="drag-handle" title="Drag to move panel" id="panel-drag-handle">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+                <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
+            </svg>
+        </div>
+        
+        <!-- Settings -->
+        <button id="btn-settings" class="control-btn" title="Dashboard Settings">
+            <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+            </svg>
+        </button>
+
+        <!-- Reload Menu -->
+        <div class="relative flex items-center justify-center">
+            <button id="btn-reload-toggle" class="control-btn" title="Reload / Restore Options">
+                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+            </button>
+            
+            <!-- Dropdown Container -->
+            <div id="reload-dropdown" class="hidden absolute bottom-full mb-3 left-1/2 -translate-x-1/2 bg-gray-900 border border-gray-600 rounded-lg shadow-2xl flex flex-col overflow-hidden w-48 py-1 z-[110]">
+                <button id="btn-reload-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-white transition-colors">Reload Current</button>
+                <button id="btn-reset-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-red-400 transition-colors" title="Hard refresh (bypass cache)">Reset Current (Hard)</button>
+                <div class="w-full h-px bg-gray-700 my-1"></div>
+                <button id="btn-reload-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-white transition-colors">Reload All URLs</button>
+                <button id="btn-reset-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-red-400 transition-colors" title="Hard refresh all (bypass cache)">Reset All (Hard)</button>
+                <div class="w-full h-px bg-gray-700 my-1"></div>
+                <button id="btn-restore-current" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-blue-300 transition-colors" title="Restore layout from baseline config">Restore Current Layout</button>
+                <button id="btn-restore-all" class="px-4 py-2 text-sm text-left hover:bg-gray-700 text-blue-300 transition-colors" title="Restore all panel layouts from baseline config">Restore All Layouts</button>
+            </div>
+        </div>
+
+        <!-- Mute -->
+        <button id="btn-mute" class="control-btn" title="Mute/Unmute iframes">
+            <svg id="icon-unmuted" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5 10v4a2 2 0 002 2h2.586l3.707 3.707A1 1 0 0015 19V5a1 1 0 00-1.707-.707L9.586 8H7a2 2 0 00-2 2z"></path>
+            </svg>
+            <svg id="icon-muted" class="hidden text-red-400" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"></path>
+            </svg>
+        </button>
+
+        <!-- Toggle Queue -->
+        <button id="btn-toggle-queue" class="control-btn" title="Toggle Queue Visibility">
+            <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h7"></path>
+            </svg>
+        </button>
+
+        <!-- Playback Controls -->
+        <button id="btn-prev" class="control-btn" title="Previous Slide">
+            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"></path>
+            </svg>
+        </button>
+        <button id="btn-playpause" class="control-btn" title="Pause / Resume">
+            <svg id="icon-pause" width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path>
+            </svg>
+            <svg id="icon-play" class="hidden" width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"></path>
+            </svg>
+        </button>
+        <button id="btn-next" class="control-btn" title="Next Slide">
+            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"></path>
+            </svg>
+        </button>
+    </div>
+
+    <!-- LAYER 5: Settings Modal -->
+    <div id="settings-modal" class="fixed inset-0 bg-black bg-opacity-80 z-[100] flex items-center justify-center p-4 hidden">
+        <div id="settings-panel" class="bg-gray-800 rounded-xl p-6 w-full max-w-4xl shadow-2xl flex flex-col max-h-[90vh] relative">
+            <div class="drag-handle w-full absolute top-2 left-0 right-0 h-6" id="settings-drag-handle" title="Drag to move panel">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+                    <path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/>
+                </svg>
+            </div>
+            
+            <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 mt-4 text-white">Dashboard Configuration</h2>
+            
+            <div class="flex-1 overflow-y-auto mb-4 pr-2">
+                <!-- Requirement Notice -->
+                <div class="mb-6 p-3 bg-blue-900 border border-blue-700 text-blue-100 text-sm rounded">
+                    <strong>Critical Requirement:</strong> To embed external sites that enforce strictly framed security policies (like <em>zoom.earth</em>), you <strong>must</strong> use a browser extension to strip security headers locally. 
+                    <a href="https://github.com/ThomazPom/Moz-Ext-Ignore-X-Frame-Options" target="_blank" rel="noopener noreferrer" class="text-blue-300 hover:text-white underline font-bold">Install Ignore X-Frame-Options (Firefox)</a> or a similar FOSS extension.
+                </div>
+
+                <!-- Global Settings -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Rotation Interval (Seconds)</label>
+                        <div class="flex gap-2">
+                            <input type="number" id="input-interval" class="flex-1 bg-gray-900 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" min="1">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">UI Transparency</label>
+                        <div class="flex flex-col gap-2 bg-gray-900 p-3 rounded border border-gray-700">
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-xs text-gray-400">Opacity Level</span>
+                                <span id="opacity-val" class="bg-gray-800 px-2 py-0.5 rounded text-xs"></span>
+                            </div>
+                            <input type="range" id="input-opacity" min="0.1" max="1" step="0.05" class="w-full cursor-pointer">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- URL Items List -->
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-300 mb-2">Slideshow Items (URLs & Labels)</label>
+                    <div id="item-list" class="space-y-3 mb-4">
+                        <!-- Populated dynamically via JS -->
+                    </div>
+                    
+                    <!-- Add New Item -->
+                    <div class="bg-gray-900 border border-gray-700 rounded p-4">
+                        <h4 class="text-sm font-bold text-gray-400 mb-2">Add New Sequence Item</h4>
+                        <div class="flex flex-col md:flex-row gap-2">
+                            <input type="text" id="new-url" class="flex-[2] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" placeholder="Valid URL (https://...)">
+                            <input type="text" id="new-label" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500" placeholder="Display Label">
+                            <button id="btn-add-item" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors whitespace-nowrap">Add Item</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="border-t border-gray-700 pt-4 flex flex-wrap justify-between gap-2">
+                <div class="flex gap-2">
+                    <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors text-sm" title="Download Live Config as JSON">Export Config</button>
+                    <label for="input-import" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors text-sm cursor-pointer inline-flex items-center" title="Upload JSON Config (Becomes new Baseline)">
+                        Import Config
+                    </label>
+                    <input type="file" id="input-import" accept=".json" class="hidden">
+                </div>
+                <div class="flex gap-2">
+                    <button id="btn-cancel" class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded transition-colors">Discard</button>
+                    <button id="btn-save" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded font-semibold transition-colors">Save & Apply</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        /**
+         * @typedef {Object} ElementStyle
+         * @property {string} top
+         * @property {string} left
+         * @property {string} bottom
+         * @property {string} right
+         * @property {string} [width]
+         * @property {string} [height]
+         */
+
+        /**
+         * @typedef {Object} DashboardItem
+         * @property {string} url - The external site URL to load in the iframe.
+         * @property {string} label - The text displayed on the draggable floating label.
+         * @property {ElementStyle} style - Coordinates and dimensions of the label.
+         */
+
+        /**
+         * @typedef {Object} DashboardConfig
+         * @property {number} intervalSeconds - Time each iframe stays active.
+         * @property {number} uiOpacity - Transparency level for UI elements.
+         * @property {boolean} showQueue - Whether the queue panel is visible.
+         * @property {ElementStyle} panelPos - Coordinates of the main control panel.
+         * @property {ElementStyle} queuePos - Coordinates of the queue overlay.
+         * @property {ElementStyle|null} settingsPos - Coordinates of the settings modal.
+         * @property {DashboardItem[]} items - Array of URLs and their associated labels.
+         */
+
+        // ----------------------------------------------------------------------
+        // STATE MANAGEMENT
+        // ----------------------------------------------------------------------
+        const STORAGE_KEY_LIVE = 'tvDashboardLiveV4';
+        const STORAGE_KEY_BASELINE = 'tvDashboardBaselineV4';
+
+        /** @type {DashboardConfig} Default initial configuration. */
+        const DEFAULT_CONFIG = {
+            intervalSeconds: 10,
+            uiOpacity: 0.8,
+            showQueue: true,
+            panelPos: { bottom: '24px', right: '24px', left: 'auto', top: 'auto' },
+            queuePos: { top: '24px', right: '24px', left: 'auto', bottom: 'auto' },
+            settingsPos: null,
+            items: [
+                { url: "https://play.grafana.org/d/efa86fd1d0c121a26444b636a3f509a8/kubernetes-compute-resources-cluster?from=now-30m&to=now&timezone=UTC&var-datasource=grafanacloud-prom&var-cluster=appenv-grafana-play-cluster&var-lokids=%24__all&refresh=30s", label: "Kubernetes Cluster", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
+                { url: "https://play.grafana.org/d/T512JVH7z/loki-nginx-service-mesh-json-version?from=now-6h&to=now&timezone=browser&var-datasource=ac4000ca-1959-45f5-aa45-2bd0898f7026&var-label_name=filename&var-label_value=%2Fvar%2Flog%2Fnginx%2Fjson_access.log&var-job=%24__all&var-instance=%24__all", label: "NGINX Logs", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
+                { url: "https://www.openstreetmap.org/export/embed.html?bbox=-106.2559%2C28.5750%2C-105.8159%2C28.7918&layer=mapnik&marker=28.6369%2C-106.0767", label: "Street Map", style: { top: '20px', left: '20px', width: '250px', height: '60px' } },
+                { url: "https://en.wikipedia.org/wiki/Portal:Current_events", label: "Current Events", style: { top: '20px', left: '20px', width: '250px', height: '60px' } }
+            ]
+        };
+
+        /** @type {DashboardConfig} The currently active/edited configuration. */
+        let liveConfig = null;
+        /** @type {DashboardConfig} The configuration used as a restore point (initial or imported). */
+        let baselineConfig = null;
+        /** @type {DashboardConfig} Temporary config used while editing in the settings modal. */
+        let tempConfig = null;
+
+        let iframes = [];
+        let labels = [];
+        let currentIndex = 0;
+        let intervalId = null;
+        let isPlaying = true;
+        let isMuted = false;
+
+        // ----------------------------------------------------------------------
+        // INITIALIZATION
+        // ----------------------------------------------------------------------
+
+        /**
+         * Bootstrap the application.
+         * Loads state, applies CSS, builds DOM elements, and starts timers.
+         */
+        function init() {
+            loadConfig();
+            applyGlobalStyles();
+            buildDashboard();
+            startSlideshow();
+            
+            // Initialize drag handlers for UI panels
+            setupDraggablePanel('panel-drag-handle', 'control-panel', 'panelPos');
+            setupDraggablePanel('queue-drag-handle', 'queue-overlay', 'queuePos');
+            setupDraggablePanel('settings-drag-handle', 'settings-panel', 'settingsPos');
+        }
+
+        /**
+         * Loads configuration from localStorage.
+         * Ensures both a Live and Baseline config exist.
+         */
+        function loadConfig() {
+            const savedLive = localStorage.getItem(STORAGE_KEY_LIVE);
+            const savedBaseline = localStorage.getItem(STORAGE_KEY_BASELINE);
+
+            if (savedLive && savedBaseline) {
+                try {
+                    liveConfig = JSON.parse(savedLive);
+                    baselineConfig = JSON.parse(savedBaseline);
+                } catch (e) {
+                    console.error("Failed to parse config. Restoring defaults.", e);
+                    resetToDefaults();
+                }
+            } else {
+                resetToDefaults();
+            }
+        }
+
+        /**
+         * Resets state entirely using the FOSS default constant.
+         */
+        function resetToDefaults() {
+            liveConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+            baselineConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+            saveConfig();
+        }
+
+        /**
+         * Serializes the current Live and Baseline configs to localStorage.
+         */
+        function saveConfig() {
+            localStorage.setItem(STORAGE_KEY_LIVE, JSON.stringify(liveConfig));
+            localStorage.setItem(STORAGE_KEY_BASELINE, JSON.stringify(baselineConfig));
+        }
+
+        /**
+         * Applies positioning and opacity to global UI components based on liveConfig.
+         */
+        function applyGlobalStyles() {
+            const controlPanel = document.getElementById('control-panel');
+            controlPanel.style.opacity = liveConfig.uiOpacity;
+            applyPosition(controlPanel, liveConfig.panelPos);
+            
+            const queueOverlay = document.getElementById('queue-overlay');
+            if (liveConfig.showQueue) {
+                queueOverlay.classList.remove('hidden');
+                queueOverlay.style.opacity = liveConfig.uiOpacity;
+            } else {
+                queueOverlay.classList.add('hidden');
+            }
+            applyPosition(queueOverlay, liveConfig.queuePos);
+
+            const settingsPanel = document.getElementById('settings-panel');
+            if (liveConfig.settingsPos && liveConfig.settingsPos.top !== 'auto') {
+                settingsPanel.style.position = 'absolute';
+                settingsPanel.style.margin = '0';
+                applyPosition(settingsPanel, liveConfig.settingsPos);
+            }
+        }
+
+        /**
+         * Helper to apply an ElementStyle object to an HTML element.
+         * @param {HTMLElement} el 
+         * @param {ElementStyle} pos 
+         */
+        function applyPosition(el, pos) {
+            if (!pos) return;
+            el.style.top = pos.top || 'auto';
+            el.style.left = pos.left || 'auto';
+            el.style.bottom = pos.bottom || 'auto';
+            el.style.right = pos.right || 'auto';
+            if (pos.width) el.style.width = pos.width;
+            if (pos.height) el.style.height = pos.height;
+        }
+
+        // ----------------------------------------------------------------------
+        // DOM CONSTRUCTION (IFRAMES, LABELS, QUEUE)
+        // ----------------------------------------------------------------------
+
+        /**
+         * Wipes the main stage containers and rebuilds all Iframes, Labels, and Queue items.
+         */
+        function buildDashboard() {
+            const container = document.getElementById('iframe-container');
+            const labelContainer = document.getElementById('label-container');
+            const queueList = document.getElementById('queue-list');
+            
+            container.innerHTML = '';
+            labelContainer.innerHTML = '';
+            queueList.innerHTML = '';
+            
+            iframes = [];
+            labels = [];
+            currentIndex = 0;
+
+            if (liveConfig.items.length === 0) return;
+
+            liveConfig.items.forEach((item, index) => {
+                // 1. Build Queue Entry
+                const qItem = document.createElement('div');
+                qItem.className = `queue-item ${index === 0 ? 'active' : ''}`;
+                qItem.id = `queue-item-${index}`;
+                qItem.innerText = `${index + 1}. ${item.label || 'Untitled'}`;
+                queueList.appendChild(qItem);
+
+                // 2. Build Iframe (All load simultaneously)
+                const iframe = document.createElement('iframe');
+                iframe.src = item.url;
+                if(index === 0) iframe.classList.add('active');
+                container.appendChild(iframe);
+                iframes.push(iframe);
+
+                // 3. Build Floating Label
+                if (item.label !== undefined) {
+                    const labelWrap = document.createElement('div');
+                    labelWrap.className = 'dashboard-label';
+                    if(index === 0) labelWrap.classList.add('active');
+                    
+                    labelWrap.style.opacity = index === 0 ? liveConfig.uiOpacity : 0; 
+                    applyPosition(labelWrap, item.style);
+
+                    // Add HTML inner structure including the Drag Handle and editable Content
+                    labelWrap.innerHTML = `
+                        <div class="label-header drag-handle">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2 12.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5zm0-5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11a.5.5 0 0 1-.5-.5z"/></svg>
+                        </div>
+                        <div class="label-content" contenteditable="true" spellcheck="false">${item.label}</div>
+                    `;
+                    
+                    setupInlineLabelEditing(labelWrap, index);
+                    setupDraggableLabel(labelWrap, index);
+                    
+                    labelContainer.appendChild(labelWrap);
+                    labels.push(labelWrap);
+                } else {
+                    labels.push(null);
+                }
+            });
+            updateMuteState();
+        }
+
+        /**
+         * Sets up contenteditable events to sync label text with the liveConfig and queue.
+         * @param {HTMLElement} labelWrap 
+         * @param {number} index 
+         */
+        function setupInlineLabelEditing(labelWrap, index) {
+            const content = labelWrap.querySelector('.label-content');
+            let wasPlaying = false;
+            
+            // Prevent dragging from firing while trying to highlight text
+            content.addEventListener('mousedown', e => e.stopPropagation());
+            
+            content.addEventListener('focus', () => {
+                wasPlaying = isPlaying;
+                if (intervalId) clearInterval(intervalId); // Pause rotation automatically
+            });
+            
+            content.addEventListener('blur', (e) => {
+                const newText = e.target.innerText.trim();
+                liveConfig.items[index].label = newText;
+                
+                // Synchronously update the queue item
+                const qItem = document.getElementById(`queue-item-${index}`);
+                if(qItem) qItem.innerText = `${index + 1}. ${newText}`;
+                
+                saveConfig();
+                if (wasPlaying) startSlideshow();
+            });
+            
+            content.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    content.blur(); // Blur triggers the save logic above
+                }
+            });
+        }
+
+        // ----------------------------------------------------------------------
+        // SLIDESHOW LOGIC
+        // ----------------------------------------------------------------------
+
+        /**
+         * Updates CSS classes to reveal the active iframe and hide others.
+         */
+        function updateView() {
+            iframes.forEach((ifr, i) => {
+                const isActive = (i === currentIndex);
+                const qItem = document.getElementById(`queue-item-${i}`);
+                
+                if (isActive) {
+                    ifr.classList.add('active');
+                    if(qItem) qItem.classList.add('active');
+                    if(labels[i]) {
+                        labels[i].classList.add('active');
+                        labels[i].style.opacity = liveConfig.uiOpacity;
+                    }
+                } else {
+                    ifr.classList.remove('active');
+                    if(qItem) qItem.classList.remove('active');
+                    if(labels[i]) {
+                        labels[i].classList.remove('active');
+                        labels[i].style.opacity = 0;
+                    }
+                }
+            });
+        }
+
+        function nextSlide() {
+            if (iframes.length <= 1) return;
+            currentIndex = (currentIndex + 1) % iframes.length;
+            updateView();
+        }
+
+        function prevSlide() {
+            if (iframes.length <= 1) return;
+            currentIndex = (currentIndex - 1 + iframes.length) % iframes.length;
+            updateView();
+        }
+
+        function startSlideshow() {
+            if (intervalId) clearInterval(intervalId);
+            if (iframes.length > 1) {
+                intervalId = setInterval(nextSlide, liveConfig.intervalSeconds * 1000);
+            }
+            isPlaying = true;
+            document.getElementById('icon-play').classList.add('hidden');
+            document.getElementById('icon-pause').classList.remove('hidden');
+        }
+
+        function pauseSlideshow() {
+            clearInterval(intervalId);
+            isPlaying = false;
+            document.getElementById('icon-pause').classList.add('hidden');
+            document.getElementById('icon-play').classList.remove('hidden');
+        }
+
+        // ----------------------------------------------------------------------
+        // DRAG & DROP LOGIC (MATHEMATICS & PERSISTENCE)
+        // ----------------------------------------------------------------------
+
+        /**
+         * Generic Draggable implementation for UI panels (Main Control, Queue, Settings).
+         * Uses offset calculations and translates bottom/right constraints into absolute top/left.
+         * @param {string} handleId 
+         * @param {string} elementId 
+         * @param {string} configKey - Property inside liveConfig to save coords.
+         */
+        function setupDraggablePanel(handleId, elementId, configKey) {
+            const handle = document.getElementById(handleId);
+            const element = document.getElementById(elementId);
+            if (!handle || !element) return;
+            
+            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+            
+            handle.onmousedown = (e) => {
+                e.preventDefault();
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                
+                // Convert flexible flex positioning (like centered modals) to strict absolute coordinates
+                if (window.getComputedStyle(element).position !== 'absolute') {
+                    const rect = element.getBoundingClientRect();
+                    element.style.position = 'absolute';
+                    element.style.margin = '0';
+                    element.style.transform = 'none';
+                    element.style.top = rect.top + 'px';
+                    element.style.left = rect.left + 'px';
+                    element.style.right = 'auto';
+                    element.style.bottom = 'auto';
+                }
+
+                document.onmouseup = () => {
+                    document.onmouseup = null;
+                    document.onmousemove = null;
+                    if (configKey) {
+                        liveConfig[configKey] = {
+                            top: element.style.top || (element.offsetTop + "px"),
+                            left: element.style.left || (element.offsetLeft + "px"),
+                            bottom: 'auto', 
+                            right: 'auto'
+                        };
+                        saveConfig();
+                    }
+                };
+
+                document.onmousemove = (e) => {
+                    e.preventDefault();
+                    pos1 = pos3 - e.clientX;
+                    pos2 = pos4 - e.clientY;
+                    pos3 = e.clientX;
+                    pos4 = e.clientY;
+                    element.style.top = (element.offsetTop - pos2) + "px";
+                    element.style.left = (element.offsetLeft - pos1) + "px";
+                    element.style.bottom = 'auto';
+                    element.style.right = 'auto';
+                };
+            };
+        }
+
+        /**
+         * Specialized draggable for Labels, ensuring it also captures native CSS resize events.
+         * @param {HTMLElement} element 
+         * @param {number} index - Index of the item in liveConfig.items
+         */
+        function setupDraggableLabel(element, index) {
+            const header = element.querySelector('.label-header');
+            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+            
+            header.onmousedown = (e) => {
+                e.preventDefault();
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                
+                document.onmouseup = () => {
+                    document.onmouseup = null;
+                    document.onmousemove = null;
+                    updateLabelPersistence(index, element);
+                };
+                
+                document.onmousemove = (e) => {
+                    e.preventDefault();
+                    pos1 = pos3 - e.clientX;
+                    pos2 = pos4 - e.clientY;
+                    pos3 = e.clientX;
+                    pos4 = e.clientY;
+                    element.style.top = (element.offsetTop - pos2) + "px";
+                    element.style.left = (element.offsetLeft - pos1) + "px";
+                };
+            };
+
+            // Detect native CSS resizes (which fire a mouseup on the element body, not the header)
+            element.addEventListener('mouseup', (e) => {
+                if(e.target !== header) {
+                    updateLabelPersistence(index, element);
+                }
+            });
+        }
+
+        /**
+         * Syncs visual DOM coordinates back into the liveConfig model and saves.
+         * @param {number} index 
+         * @param {HTMLElement} element 
+         */
+        function updateLabelPersistence(index, element) {
+            liveConfig.items[index].style = {
+                top: element.style.top || (element.offsetTop + 'px'),
+                left: element.style.left || (element.offsetLeft + 'px'),
+                width: element.style.width || (element.offsetWidth + 'px'),
+                height: element.style.height || (element.offsetHeight + 'px')
+            };
+            saveConfig();
+        }
+
+        // ----------------------------------------------------------------------
+        // CACHE BUSTING & RELOAD LOGIC
+        // ----------------------------------------------------------------------
+
+        /**
+         * Helper utility to inject a cache-busting timestamp query parameter securely.
+         * Ensures fragments (#) remain at the very end of the URL string.
+         * @param {string} urlStr 
+         * @returns {string} 
+         */
+        function getCacheBustedUrl(urlStr) {
+            try {
+                const url = new URL(urlStr);
+                url.searchParams.set('cb', Date.now());
+                return url.toString();
+            } catch (e) {
+                const [base, hash] = urlStr.split('#');
+                const separator = base.includes('?') ? '&' : '?';
+                return `${base}${separator}cb=${Date.now()}${hash ? '#' + hash : ''}`;
+            }
+        }
+
+        /**
+         * Helper to force an iframe to completely destroy its inner context and rebuild.
+         * @param {HTMLIFrameElement} ifr 
+         * @param {string} src 
+         */
+        function forceFrameRebuild(ifr, src) {
+            ifr.src = ''; 
+            setTimeout(() => { ifr.src = src; }, 50);
+        }
+
+        // ----------------------------------------------------------------------
+        // EVENT LISTENERS (UI CONTROLS)
+        // ----------------------------------------------------------------------
+
+        // Play/Pause/Prev/Next
+        document.getElementById('btn-playpause').addEventListener('click', () => isPlaying ? pauseSlideshow() : startSlideshow());
+        document.getElementById('btn-next').addEventListener('click', () => { pauseSlideshow(); nextSlide(); });
+        document.getElementById('btn-prev').addEventListener('click', () => { pauseSlideshow(); prevSlide(); });
+
+        // Toggle Queue visibility dynamically
+        document.getElementById('btn-toggle-queue').addEventListener('click', () => {
+            liveConfig.showQueue = !liveConfig.showQueue;
+            saveConfig();
+            applyGlobalStyles();
+        });
+
+        // Mute Handling (Primarily conceptual as cross-origin restricts script interaction)
+        function updateMuteState() {
+            const iconMuted = document.getElementById('icon-muted');
+            const iconUnmuted = document.getElementById('icon-unmuted');
+            if(isMuted) {
+                iconUnmuted.classList.add('hidden');
+                iconMuted.classList.remove('hidden');
+            } else {
+                iconMuted.classList.add('hidden');
+                iconUnmuted.classList.remove('hidden');
+            }
+            iframes.forEach(ifr => {
+                try { ifr.contentWindow.postMessage('{"event":"command","func":"mute"}', '*'); } catch(e){}
+            });
+        }
+        document.getElementById('btn-mute').addEventListener('click', () => {
+            isMuted = !isMuted;
+            updateMuteState();
+        });
+
+        // Dropdown Toggle
+        const reloadDropdown = document.getElementById('reload-dropdown');
+        document.getElementById('btn-reload-toggle').addEventListener('click', (e) => {
+            e.stopPropagation();
+            reloadDropdown.classList.toggle('hidden');
+        });
+        document.addEventListener('click', (e) => {
+            if (!reloadDropdown.contains(e.target) && e.target.id !== 'btn-reload-toggle') {
+                reloadDropdown.classList.add('hidden');
+            }
+        });
+
+        // Dropdown Action: Reload Current (Soft)
+        document.getElementById('btn-reload-current').addEventListener('click', () => {
+            if(iframes[currentIndex] && liveConfig.items[currentIndex]) {
+                forceFrameRebuild(iframes[currentIndex], liveConfig.items[currentIndex].url);
+            }
+            reloadDropdown.classList.add('hidden');
+        });
+        
+        // Dropdown Action: Reset Current (Hard)
+        document.getElementById('btn-reset-current').addEventListener('click', () => {
+            if(iframes[currentIndex] && liveConfig.items[currentIndex]) {
+                forceFrameRebuild(iframes[currentIndex], getCacheBustedUrl(liveConfig.items[currentIndex].url));
+            }
+            reloadDropdown.classList.add('hidden');
+        });
+
+        // Dropdown Action: Reload All (Soft)
+        document.getElementById('btn-reload-all').addEventListener('click', () => {
+            iframes.forEach((ifr, idx) => {
+                if(liveConfig.items[idx]) forceFrameRebuild(ifr, liveConfig.items[idx].url);
+            });
+            reloadDropdown.classList.add('hidden');
+        });
+        
+        // Dropdown Action: Reset All (Hard)
+        document.getElementById('btn-reset-all').addEventListener('click', () => {
+            iframes.forEach((ifr, idx) => {
+                if(liveConfig.items[idx]) forceFrameRebuild(ifr, getCacheBustedUrl(liveConfig.items[idx].url));
+            });
+            reloadDropdown.classList.add('hidden');
+        });
+
+        // Dropdown Action: Restore Current Layout (Pull from baselineConfig)
+        document.getElementById('btn-restore-current').addEventListener('click', () => {
+            if (baselineConfig.items[currentIndex]) {
+                liveConfig.items[currentIndex].style = JSON.parse(JSON.stringify(baselineConfig.items[currentIndex].style));
+                saveConfig();
+                
+                // Instantly apply without full rebuild
+                if (labels[currentIndex]) {
+                    applyPosition(labels[currentIndex], liveConfig.items[currentIndex].style);
+                }
+            }
+            reloadDropdown.classList.add('hidden');
+        });
+
+        // Dropdown Action: Restore All Layouts (Pull completely from baselineConfig)
+        document.getElementById('btn-restore-all').addEventListener('click', () => {
+            // Restore Panel coordinates
+            liveConfig.panelPos = JSON.parse(JSON.stringify(baselineConfig.panelPos));
+            liveConfig.queuePos = JSON.parse(JSON.stringify(baselineConfig.queuePos));
+            liveConfig.settingsPos = baselineConfig.settingsPos ? JSON.parse(JSON.stringify(baselineConfig.settingsPos)) : null;
+            
+            // Restore all Label coordinates safely
+            liveConfig.items.forEach((item, idx) => {
+                if (baselineConfig.items[idx]) {
+                    item.style = JSON.parse(JSON.stringify(baselineConfig.items[idx].style));
+                }
+            });
+            
+            saveConfig();
+            applyGlobalStyles();
+            
+            // Apply to all live label DOM elements
+            labels.forEach((lbl, idx) => {
+                if(lbl && liveConfig.items[idx]) applyPosition(lbl, liveConfig.items[idx].style);
+            });
+            
+            reloadDropdown.classList.add('hidden');
+        });
+
+
+        // ----------------------------------------------------------------------
+        // SETTINGS MODAL & CONFIG MANAGEMENT
+        // ----------------------------------------------------------------------
+        
+        const modal = document.getElementById('settings-modal');
+        const settingsListEl = document.getElementById('item-list');
+        const inputOpacity = document.getElementById('input-opacity');
+        const opacityVal = document.getElementById('opacity-val');
+
+        /**
+         * Renders the dynamic list of URLs and Labels in the settings modal.
+         * Binds real-time onChange events to the tempConfig object.
+         */
+        function renderSettingsList() {
+            settingsListEl.innerHTML = '';
+            tempConfig.items.forEach((item, idx) => {
+                const row = document.createElement('div');
+                row.className = "flex flex-col md:flex-row gap-2 bg-gray-900 border border-gray-700 p-3 rounded";
+                row.innerHTML = `
+                    <div class="flex-1 flex flex-col gap-1">
+                        <input type="text" class="edit-url bg-gray-800 text-sm border border-gray-600 rounded px-2 py-1 text-white" value="${item.url}" data-idx="${idx}" placeholder="URL">
+                        <input type="text" class="edit-label bg-gray-800 text-sm border border-gray-600 rounded px-2 py-1 text-white" value="${item.label}" data-idx="${idx}" placeholder="Label Text">
+                    </div>
+                    <div class="flex items-center">
+                        <button class="text-red-500 hover:bg-red-900 hover:bg-opacity-30 p-2 rounded remove-item" data-idx="${idx}" title="Remove Item">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
+                        </button>
+                    </div>
+                `;
+                settingsListEl.appendChild(row);
+            });
+
+            // Bind tempConfig updates
+            document.querySelectorAll('.edit-url').forEach(el => el.addEventListener('change', e => {
+                tempConfig.items[e.target.dataset.idx].url = e.target.value;
+            }));
+            document.querySelectorAll('.edit-label').forEach(el => el.addEventListener('change', e => {
+                tempConfig.items[e.target.dataset.idx].label = e.target.value;
+            }));
+            document.querySelectorAll('.remove-item').forEach(el => el.addEventListener('click', e => {
+                tempConfig.items.splice(parseInt(e.currentTarget.dataset.idx), 1);
+                renderSettingsList();
+            }));
+        }
+
+        // Open Settings Modal
+        document.getElementById('btn-settings').addEventListener('click', () => {
+            pauseSlideshow();
+            tempConfig = JSON.parse(JSON.stringify(liveConfig)); // Deep copy to prevent mutating live state
+            
+            document.getElementById('input-interval').value = tempConfig.intervalSeconds;
+            inputOpacity.value = tempConfig.uiOpacity;
+            opacityVal.innerText = tempConfig.uiOpacity;
+            
+            renderSettingsList();
+            modal.classList.remove('hidden');
+        });
+
+        // Close/Cancel Settings Modal
+        document.getElementById('btn-cancel').addEventListener('click', () => {
+            modal.classList.add('hidden');
+            // Revert any visual opacity tweaks that occurred while sliding
+            applyGlobalStyles();
+            if(isPlaying) startSlideshow();
+        });
+
+        // Add Item Logic in Modal
+        document.getElementById('btn-add-item').addEventListener('click', () => {
+            const urlInput = document.getElementById('new-url');
+            const labelInput = document.getElementById('new-label');
+            if(urlInput.value.trim()) {
+                tempConfig.items.push({
+                    url: urlInput.value.trim(),
+                    label: labelInput.value.trim(),
+                    style: { top: '20px', left: '20px', width: '200px', height: '60px' }
+                });
+                urlInput.value = '';
+                labelInput.value = '';
+                renderSettingsList();
+            }
+        });
+
+        // Live preview of UI Transparency
+        inputOpacity.addEventListener('input', (e) => {
+            opacityVal.innerText = e.target.value;
+            const tempOpacity = e.target.value;
+            document.getElementById('control-panel').style.opacity = tempOpacity;
+            const q = document.getElementById('queue-overlay');
+            if(q && !q.classList.contains('hidden')) q.style.opacity = tempOpacity;
+            if(labels[currentIndex]) labels[currentIndex].style.opacity = tempOpacity;
+        });
+
+        // Save & Apply Settings
+        document.getElementById('btn-save').addEventListener('click', () => {
+            tempConfig.intervalSeconds = parseInt(document.getElementById('input-interval').value) || 10;
+            tempConfig.uiOpacity = parseFloat(inputOpacity.value) || 0.8;
+            
+            // Promote tempConfig to liveConfig
+            liveConfig = JSON.parse(JSON.stringify(tempConfig));
+            saveConfig();
+            
+            modal.classList.add('hidden');
+            applyGlobalStyles();
+            buildDashboard();
+            startSlideshow();
+        });
+
+        // ----------------------------------------------------------------------
+        // JSON IMPORT / EXPORT LOGIC
+        // ----------------------------------------------------------------------
+
+        document.getElementById('btn-export').addEventListener('click', () => {
+            // Ensure temp config values match current inputs before export
+            tempConfig.intervalSeconds = parseInt(document.getElementById('input-interval').value) || 10;
+            tempConfig.uiOpacity = parseFloat(inputOpacity.value) || 0.8;
+            
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(tempConfig, null, 2));
+            const a = document.createElement('a');
+            a.href = dataStr;
+            a.download = "tv_dashboard_config.json";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        });
+
+        document.getElementById('input-import').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            
+            reader.onload = function(evt) {
+                try {
+                    const imported = JSON.parse(evt.target.result);
+                    if (imported.items && Array.isArray(imported.items)) {
+                        tempConfig = imported;
+                        // Synchronize imported FOSS properties to baseline explicitly
+                        baselineConfig = JSON.parse(JSON.stringify(imported)); 
+                        
+                        // Update UI fields
+                        document.getElementById('input-interval').value = tempConfig.intervalSeconds || 10;
+                        inputOpacity.value = tempConfig.uiOpacity || 0.8;
+                        opacityVal.innerText = inputOpacity.value;
+                        
+                        renderSettingsList();
+                        alert("Settings successfully imported! It is now set as the new Baseline. Click 'Save & Apply' to use them.");
+                    } else {
+                        alert("Invalid JSON format. Cannot parse Dashboard parameters.");
+                    }
+                } catch (err) {
+                    alert("Error reading JSON file.");
+                }
+                e.target.value = ''; // Reset input to allow re-import of same file
+            };
+            reader.readAsText(file);
+        });
+
+        // Run application on load
+        window.onload = init;
+    </script>
+</body>
+</html>
